@@ -1,0 +1,51 @@
+---
+title: "Recording completion and publication"
+---
+stateDiagram-v2
+  state "Legend" as legend {
+    lg0: ready
+    lg1: failure
+    lg2: working
+  }
+  class lg0 teal
+  class lg1 orange
+  class lg2 blue
+  s0: Recording output
+  s1: Drain and sync interval
+  s2: Drain and sync process
+  s3: Partial recording
+  s4: Publish interval
+  s5: Publish process
+  s6: Sync interval directory
+  s7: Sync process directory
+  s8: Partial#59; publication unconfirmed
+  s9: Saved interval
+  s10: Saved process
+  [*] --> s0
+  s0 --> s1: stop recording#59; child continues
+  s0 --> s2: process exited and output reached EOF
+  s0 --> s3: abort or write failure or queue capacity exceeded
+  s1 --> s3: I/O failure or deadline
+  s2 --> s3: I/O failure or deadline
+  s1 --> s4: file synced and closed
+  s2 --> s5: file synced and closed
+  s4 --> s6: target link created without replacement
+  s4 --> s3: I/O failure or deadline or target already exists
+  s5 --> s7: target link created without replacement
+  s5 --> s3: I/O failure or deadline or target already exists
+  s6 --> s8: I/O failure or deadline
+  s7 --> s8: I/O failure or deadline
+  s6 --> s9: publication confirmed
+  s7 --> s10: publication confirmed
+  s8 --> s3: remove owned target link
+  class s0 blue
+  class s1 blue
+  class s2 blue
+  class s3 orange
+  class s4 blue
+  class s5 blue
+  class s6 blue
+  class s7 blue
+  class s8 orange
+  class s9 teal
+  class s10 teal

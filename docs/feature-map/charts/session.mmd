@@ -1,0 +1,41 @@
+---
+title: "Recorded session exit and close"
+---
+stateDiagram-v2
+  state "Legend" as legend {
+    lg0: disposed
+    lg1: failure
+    lg2: exit
+    lg3: running
+  }
+  class lg0 purple
+  class lg1 orange
+  class lg2 teal
+  class lg3 blue
+  s0: Running
+  s1: Exited#59; reading output tail
+  s2: Closing#59; waiting for exit and tail
+  s3: Exited#59; output complete
+  s4: Exited#59; output incomplete
+  s5: Disposed#59; awaiting real exit
+  s6: Closing#59; completion settled
+  s7: Disposed#59; cleanup attempted
+  [*] --> s0
+  s0 --> s1: main process exits
+  s0 --> s2: close requested#59; notify listeners
+  s1 --> s3: tail reaches EOF#59; recorder settles
+  s1 --> s4: tail fails or times out#59; recorder aborts
+  s1 --> s2: close requested#59; notify listeners
+  s2 --> s5: close deadline#59; abort settles
+  s3 --> s6: close requested#59; notify listeners
+  s4 --> s6: close requested#59; notify listeners
+  s5 --> s7: main process exits
+  s2 --> s6: tail reaches EOF#59; recorder settles or tail fails or times out#59; recorder aborts
+  s2 --> s7: close deadline#59; abort settles
+  s6 --> s7: dispose terminal
+  class s0 blue
+  class s1 teal
+  class s3 teal
+  class s4 orange
+  class s5 purple
+  class s7 purple

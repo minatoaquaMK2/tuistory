@@ -1,0 +1,45 @@
+---
+title: "Relay startup decision flow"
+---
+stateDiagram-v2
+  state "Legend" as legend {
+    lg0: ready
+    lg1: failure
+    lg2: working
+  }
+  class lg0 teal
+  class lg1 orange
+  class lg2 blue
+  s0: Probe port
+  s1: Acquire restart lock
+  s2: Use compatible daemon
+  s3: Recheck under lock
+  s4: Wait for lock owner
+  s5: Report failure
+  s6: Stop unusable daemon
+  s7: Port confirmed free
+  s8: Wait for new daemon
+  [*] --> s0
+  s0 --> s2: version is compatible
+  s0 --> s1: daemon is missing or unusable
+  s1 --> s3: lock acquired
+  s1 --> s4: another client owns lock
+  s3 --> s2: compatible daemon appeared
+  s3 --> s7: no listener
+  s3 --> s6: older or unresponsive listener
+  s4 --> s3: owner releases or dies#59; acquire lock
+  s4 --> s5: owner wait times out
+  s6 --> s5: port remains occupied
+  s6 --> s7: port becomes free
+  s7 --> s8: spawn replacement
+  s8 --> s2: compatible response arrives
+  s8 --> s5: startup times out
+  class s0 blue
+  class s1 blue
+  class s2 teal
+  class s3 blue
+  class s4 blue
+  class s5 orange
+  class s6 blue
+  class s7 blue
+  class s8 blue

@@ -367,7 +367,7 @@ The restart is **race-safe**: a file lock prevents two concurrent CLI invocation
 
 ```bash
 tuistory daemon-stop    # Stops daemon and closes all sessions
-tuistory log-path       # Print the daemon log file path
+tuistory logfile        # Print the daemon log file path
 ```
 
 ### Security model
@@ -515,6 +515,12 @@ session.close()
 For recorded sessions, use `await session.closeAsync()` to finish writing the recording. For unrecorded sessions, close returns immediately; use `await session.waitForExit(timeout)` to wait for the main process.
 
 The main process owns the session lifetime. Recorded sessions allow up to 200 ms for trailing output after it exits. Keep servers in the foreground or keep their shell alive with `wait`.
+
+## Feature map and verification
+
+The [feature map](docs/feature-map/README.md) links CLI commands and library APIs to source, tests, and candidate formal properties. It includes [Pele statecharts and bounded TLA+ starter models](docs/feature-map/statecharts.md), with explicit assumptions and reproduction commands.
+
+Run `bun scripts/check-feature-map.mjs` to check inventory coverage and local links.
 
 ## Projects using tuistory
 

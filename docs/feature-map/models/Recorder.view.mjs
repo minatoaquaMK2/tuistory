@@ -1,0 +1,5 @@
+export const title = 'Recording completion and publication';
+export const state = (v) => v.phase === 'active' ? 'Recording output' : v.phase === 'partial' ? (v.target === 'owned' ? 'Partial; publication unconfirmed' : 'Partial recording') : v.phase === 'saved' ? `Saved ${v.extent}` : !v.fileSynced ? `Drain and sync ${v.extent}` : v.target !== 'owned' ? `Publish ${v.extent}` : `Sync ${v.extent} directory`;
+export const step = (a, from) => a === 'Abort' ? (from.phase === 'active' ? 'abort or write failure' : 'I/O failure or deadline') : ({AdmitOutput:'accept output',Overflow:'queue capacity exceeded',Drain:'write queued event',StopInterval:'stop recording; child continues',FinishProcess:'process exited and output reached EOF',SyncFile:'file synced and closed',Publish:'target link created without replacement',TargetConflict:'target already exists',SyncDirectory:'directory synced',Save:'publication confirmed',CleanupOwned:'remove owned target link',Done:'result retained'})[a] ?? a;
+export const group = (v) => v.phase === 'saved' ? 'ready' : v.phase === 'partial' ? 'failure' : 'working';
+export const colors = {ready:'teal',failure:'orange',working:'blue'};

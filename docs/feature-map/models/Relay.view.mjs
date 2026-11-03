@@ -1,0 +1,5 @@
+export const title = 'Relay startup decision flow';
+export const state = (v) => ({probe:'Probe port',lock:'Acquire restart lock',recheck:'Recheck under lock',kill:'Stop unusable daemon',spawn:'Port confirmed free',waitNew:'Wait for new daemon',waitOwner:'Wait for lock owner',ready:'Use compatible daemon',failed:'Report failure'})[v.phase];
+export const step = (a) => ({ProbeUsable:'version is compatible',ProbeUnusable:'daemon is missing or unusable',AcquireLock:'lock acquired',WaitForOwner:'another client owns lock',RecheckUsable:'compatible daemon appeared',RecheckEmpty:'no listener',RecheckUnusable:'older or unresponsive listener',KillFreed:'port becomes free',KillStuck:'port remains occupied',Spawn:'spawn replacement',NewReady:'compatible response arrives',NewTimeout:'startup times out',OwnerAcquired:'owner releases or dies; acquire lock',OwnerTimeout:'owner wait times out',Done:'result returned'})[a] ?? a;
+export const group = (v) => v.phase === 'ready' ? 'ready' : v.phase === 'failed' ? 'failure' : 'working';
+export const colors = {ready:'teal',failure:'orange',working:'blue'};

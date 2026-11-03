@@ -1,0 +1,5 @@
+export const title = 'Recorded session exit and close';
+export const state = (v) => v.life === 'disposed' ? (v.process === 'alive' ? 'Disposed; awaiting real exit' : 'Disposed; cleanup attempted') : v.life === 'closing' ? (v.completion ? 'Closing; completion settled' : 'Closing; waiting for exit and tail') : v.process === 'alive' ? 'Running' : v.output === 'open' ? 'Exited; reading output tail' : v.output === 'eof' ? 'Exited; output complete' : 'Exited; output incomplete';
+export const step = (a) => ({Write:'forward input',Exit:'main process exits',DrainEOF:'tail reaches EOF; recorder settles',DrainFailure:'tail fails or times out; recorder aborts',Close:'close requested; notify listeners',CloseComplete:'dispose terminal',CloseDeadline:'close deadline; abort settles',RepeatClose:'reuse close operation',RetainSnapshot:'retain readable terminal'})[a] ?? a;
+export const group = (v) => v.life === 'disposed' ? 'disposed' : v.output === 'incomplete' ? 'failure' : v.process === 'exited' ? 'exit' : 'running';
+export const colors = {disposed:'purple',failure:'orange',exit:'teal',running:'blue'};
