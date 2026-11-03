@@ -1735,11 +1735,15 @@ async function probeRelay(): Promise<RelayStatus> {
 
 // PID files are diagnostic only: stale text can name an unrelated live process.
 async function killRelay(): Promise<boolean> {
+  if (!await isPortInUse(RELAY_PORT)) return true
+  const initial = await errore.tryAsync(() => findRelayListeners(RELAY_PORT))
+  if (initial instanceof Error || initial.length === 0) return !await isPortInUse(RELAY_PORT)
+  const targets = new Set(initial.map(listener => listener.pid))
   const signals: Array<'SIGTERM' | 'SIGKILL'> = ['SIGTERM', 'SIGKILL']
   for (const signal of signals) {
-    if (!await isPortInUse(RELAY_PORT)) return true
-    const listeners = await errore.tryAsync(() => findRelayListeners(RELAY_PORT))
+    const listeners = signal === 'SIGTERM' ? initial : await errore.tryAsync(() => findRelayListeners(RELAY_PORT))
     if (listeners instanceof Error || listeners.length === 0) return !await isPortInUse(RELAY_PORT)
+    if (listeners.some(listener => !targets.has(listener.pid))) return !await isPortInUse(RELAY_PORT)
     for (const pid of new Set(listeners.map(listener => listener.pid))) errore.try(() => process.kill(pid, signal))
     if (await waitForPortFree(RELAY_PORT, signal === 'SIGTERM' ? RELAY_FORCE_KILL_DELAY_MS : 5000)) return true
   }
@@ -2220,8 +2224,8 @@ function failRelay(err: Error): never {
 // spawn one replacement.
 async function ensureRelayRunning(): Promise<void> {
   // Fast path: a healthy, new-enough daemon is already serving.
-  const status = await probeRelay()
-  if (status.kind === 'healthy' && isUsableVersion(status.version)) return
+  const version = await getRelayVersion()
+  if (version !== null && isUsableVersion(version)) return
 
   try {
     await withRelayLifecycleLock({ directory: LIFECYCLE_LOCK_DIR }, async () => {

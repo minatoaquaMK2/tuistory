@@ -4,7 +4,9 @@ This map connects tuistory's user features to implementation, test evidence, sta
 
 Source inspection establishes current behavior. Test links establish that a check exists, not that it ran on every platform. The [starter models and statecharts](statecharts.md) check bounded abstractions. They do not prove the TypeScript implementation. All properties below remain candidate implementation obligations.
 
-The library creates a `Session` in the caller's process. Most CLI commands instead operate on sessions retained by a local daemon. PTY output updates the terminal, retained output, recording, subscribers, and waiters. Process exit, output completion, terminal disposal, and recording publication are separate events. [Library entry](../../src/index.ts#L8), [client routing](../../src/cli.ts#L2396), [session output](../../src/session.ts#L330).
+The [concurrent lifecycle experiment](../verification/lifecycle/README.md) adds independent requirements, implementation models, refinement checks, and real-process counterexample replays. It records two further repairs and the limits that remain open.
+
+The library creates a `Session` in the caller's process. Most CLI commands instead operate on sessions retained by a local daemon. PTY output updates the terminal, retained output, recording, subscribers, and waiters. Process exit, output completion, terminal disposal, and recording publication are separate events. [Library entry](../../src/index.ts#L8), [client routing](../../src/cli.ts#L2400), [session output](../../src/session.ts#L330).
 
 ## Feature index
 
@@ -50,10 +52,10 @@ The installed CLI uses `tuistory -s demo -- <command>`. Local development uses `
 | `record mark <label>` | F08 | [marker](../../src/cli.ts#L1298) | Recorder API tests exist |
 | `record status` | F08 | [status](../../src/cli.ts#L1314) | Recorder API tests exist |
 | `record stop` | F08 | [stop interval](../../src/cli.ts#L1327) | [shutdown recording](../../src/cli.test.ts#L598), API stop tests |
-| `export <cast>` | F09 | [definition](../../src/cli.ts#L1340), [client execution](../../src/cli.ts#L2411) | Export API tests exist; CLI invocation test not identified |
+| `export <cast>` | F09 | [definition](../../src/cli.ts#L1340), [client execution](../../src/cli.ts#L2415) | Export API tests exist; CLI invocation test not identified |
 | `screenshot` | F10 | [PNG command](../../src/cli.ts#L747) | Render API tests exist; CLI invocation test not identified |
-| `attach` | F12 | [client execution](../../src/cli.ts#L2294) | [WebSocket output](../../src/cli.test.ts#L1285); UI timing untested |
-| `daemon-stop` | F01 | [stop path](../../src/cli.ts#L2377) | [orphan daemon](../../src/cli.test.ts#L665) |
+| `attach` | F12 | [client execution](../../src/cli.ts#L2298) | [WebSocket output](../../src/cli.test.ts#L1285); UI timing untested |
+| `daemon-stop` | F01 | [stop path](../../src/cli.ts#L2381) | [orphan daemon](../../src/cli.test.ts#L665) |
 | `logfile` | F14 | [log path](../../src/cli.ts#L1565) | Dedicated output assertion not identified |
 
 ## Package entry points

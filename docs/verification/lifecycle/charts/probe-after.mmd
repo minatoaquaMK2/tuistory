@@ -1,0 +1,27 @@
+---
+title: "A port probe must not become a kill target"
+---
+stateDiagram-v2
+  s0: Both callers check readiness
+  s1: One caller finished its readiness check
+  s2: Lock owner: recheck readiness
+  s3: Both callers finished their readiness checks
+  s4: Lock owner: probe with lock
+  s5: Caller holds probe socket#59; peer: check readiness
+  s6: Caller holds probe socket#59; peer: wait for lock
+  s7: Lock owner: start daemon
+  s8: Daemon is ready
+  s9: Both readiness checks finished
+  [*] --> s0
+  s0 --> s1: continue request
+  s1 --> s2: acquire lifecycle lock
+  s1 --> s3: continue request
+  s2 --> s4: continue request
+  s3 --> s2: acquire lifecycle lock
+  s4 --> s5: bind probe socket
+  s5 --> s6: continue request
+  s5 --> s7: close probe socket
+  s4 --> s6: bind probe socket
+  s6 --> s7: close probe socket
+  s7 --> s8: start service
+  s8 --> s9: continue request

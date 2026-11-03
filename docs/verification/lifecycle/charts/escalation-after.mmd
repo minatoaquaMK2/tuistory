@@ -1,0 +1,58 @@
+---
+title: "One stop operation must keep its original targets"
+---
+stateDiagram-v2
+  s0: old daemon#59; before TERM
+  s1: old daemon#59; waiting for exit
+  s2: old daemon#59; look up escalation target
+  s3: free port#59; waiting for exit
+  s4: old daemon#59; selected old
+  s5: healthy successor#59; waiting for exit
+  s6: free port#59; look up escalation target
+  s7: free port#59; operation ended
+  s8: healthy successor#59; waiting for exit#59; session alive
+  s9: healthy successor#59; look up escalation target
+  s10: healthy successor#59; operation ended
+  s11: free port#59; selected free
+  s12: free port#59; selected old
+  s13: healthy successor#59; look up escalation target#59; session alive
+  s14: healthy successor#59; operation ended#59; session alive
+  s15: healthy successor#59; selected free
+  s16: healthy successor#59; selected old
+  s17: healthy successor#59; selected successor
+  s18: healthy successor#59; selected free#59; session alive
+  s19: healthy successor#59; selected old#59; session alive
+  s20: healthy successor#59; selected successor#59; session alive
+  [*] --> s0
+  s0 --> s1: send TERM to old daemon
+  s1 --> s2: grace interval ends
+  s1 --> s3: old daemon exits
+  s2 --> s4: enumerate listener
+  s2 --> s6: old daemon exits
+  s3 --> s5: pending successor binds
+  s3 --> s7: grace interval ends
+  s4 --> s7: apply escalation policy
+  s4 --> s12: old daemon exits
+  s5 --> s8: user starts session
+  s5 --> s9: grace interval ends
+  s6 --> s9: pending successor binds
+  s6 --> s11: enumerate listener
+  s7 --> s10: pending successor binds
+  s8 --> s13: grace interval ends
+  s9 --> s13: user starts session
+  s9 --> s17: enumerate listener
+  s10 --> s14: user starts session
+  s11 --> s15: pending successor binds
+  s11 --> s7: apply escalation policy
+  s12 --> s7: apply escalation policy
+  s12 --> s16: pending successor binds
+  s13 --> s20: enumerate listener
+  s15 --> s18: user starts session
+  s15 --> s10: apply escalation policy
+  s16 --> s10: apply escalation policy
+  s16 --> s19: user starts session
+  s17 --> s20: user starts session
+  s17 --> s10: apply escalation policy
+  s18 --> s14: apply escalation policy
+  s19 --> s14: apply escalation policy
+  s20 --> s14: apply escalation policy

@@ -2,7 +2,7 @@
 
 ## F01. Relay lifecycle
 
-Ordinary commands call `ensureRelayRunning()`. `probeRelay()` returns `healthy(version)`, `no-listener`, or `occupied-unresponsive`. The port is authoritative when HTTP does not answer. A healthy daemon at an equal or newer version is reused. [Probe](../../src/cli.ts#L1717), [startup flow](../../src/cli.ts#L2221).
+Ordinary commands call `ensureRelayRunning()`. Its unlocked fast path only requests the version over HTTP. Under the lifecycle lock, `probeRelay()` returns `healthy(version)`, `no-listener`, or `occupied-unresponsive`. The port is authoritative when HTTP does not answer. A compatible healthy version observed by either check is reused. [Probe](../../src/cli.ts#L1717), [startup flow](../../src/cli.ts#L2225).
 
 | Event | Guard | State change and observable result |
 | --- | --- | --- |
@@ -10,13 +10,13 @@ Ordinary commands call `ensureRelayRunning()`. `probeRelay()` returns `healthy(v
 | Lock is busy | Another live contender has priority | Wait up to 15 seconds for ownership; recheck contenders so a dead owner does not strand waiters |
 | Acquire lock wins | Published ticket has priority and no live contender is still choosing | Re-probe before any destructive action; timeout never evicts a live owner |
 | Re-probe compatible | Another client already repaired the daemon | Release lock and reuse |
-| Replace listener | Older healthy or occupied-unresponsive listener | Signal only the IPv4 listener covering the relay address; spawn only after a successful free-port result |
+| Replace listener | Older healthy or occupied-unresponsive listener | Signal only the initial IPv4 listener targets; reject foreign PIDs during escalation; spawn only after a successful free-port result |
 | Start replacement | No listener, or kill freed the port | Spawn detached with pinned port and stable cwd; wait up to five seconds and terminate this spawn on ordinary startup timeout |
 | Bind loses | `EADDRINUSE` | Daemon exits zero without writing a PID file |
 | Shutdown | First SIGINT or SIGTERM | Reject new CLI work, close sessions, wait for pending work or deadline, clear map, remove owned PID, close server |
 | `daemon-stop` | Any occupied port state | Take the same lifecycle lock, probe, stop listener and require free port |
 
-Source ownership is split across [killRelay](../../src/cli.ts#L1737), [lifecycle lock](../../src/relay-lock.ts), [listener discovery](../../src/relay-listener.ts), [bind handlers](../../src/cli.ts#L2071), [shutdown](../../src/cli.ts#L2096), and [daemon spawn](../../src/cli.ts#L2172).
+Source ownership is split across [killRelay](../../src/cli.ts#L1737), [lifecycle lock](../../src/relay-lock.ts), [listener discovery](../../src/relay-listener.ts), [bind handlers](../../src/cli.ts#L2075), [shutdown](../../src/cli.ts#L2100), and [daemon spawn](../../src/cli.ts#L2176).
 
 Candidate properties for later implementation verification are as follows.
 
@@ -28,6 +28,8 @@ Candidate properties for later implementation verification are as follows.
 | R4 | At most one client performs replacement at a time | Unique contender directories and ticket ordering assume a coherent local filesystem. Only ESRCH permits dead-record cleanup; PID reuse can conservatively block progress. Older binaries do not use this protocol |
 
 Tests cover [shutdown during preparation](../../src/cli.test.ts#L551), [shutdown during restart](../../src/cli.test.ts#L598), [ordinary stop](../../src/cli.test.ts#L639), [missing PID](../../src/cli.test.ts#L665), [bind loss](../../src/cli.test.ts#L695), and [unresponsive listener replacement](../../src/cli.test.ts#L731). [Lifecycle regressions](../../src/relay-lifecycle.test.ts) add real interrupted contenders, crash recovery, stop/start ordering, malformed version responses and an unrelated process named by a stale PID file. The original ten-second expiry bug was reproduced before repair; these tests are not an exhaustive interleaving proof.
+
+The [concurrent lifecycle experiment](../verification/lifecycle/README.md) adds paused port-probe survival and successor preservation during escalation. Both were reproduced before repair and checked under Bun and Node. It separates ownership invariants from user-level refinement and records the remaining health-observation and pending-child gaps.
 
 ## F02. Named sessions
 
@@ -47,7 +49,7 @@ The daemon owns `Map<string, Session>` and `pendingSessions`. A pending entry is
 
 [Launch](../../src/cli.ts#L322), [duplicate and reuse decisions](../../src/cli.ts#L350), [creation guard](../../src/session.ts#L56), [close](../../src/cli.ts#L1350), [restart](../../src/cli.ts#L1416).
 
-Restarting a recorded session chooses a new randomized filename. Restart preserves `TUISTORY_SESSION_ID`; a fresh launch creates a new identity. Generated names include a cwd hash. Nested launch under `TRAFORO_URL`, `SIGILLO`, or `TUISTORY_SESSION` executes a direct child; nested recording is rejected. Human TTY launches auto-attach unless background operation is requested. [Recording filename](../../src/cli.ts#L201), [nested dispatch](../../src/cli.ts#L2470), [auto-attach](../../src/cli.ts#L2580).
+Restarting a recorded session chooses a new randomized filename. Restart preserves `TUISTORY_SESSION_ID`; a fresh launch creates a new identity. Generated names include a cwd hash. Nested launch under `TRAFORO_URL`, `SIGILLO`, or `TUISTORY_SESSION` executes a direct child; nested recording is rejected. Human TTY launches auto-attach unless background operation is requested. [Recording filename](../../src/cli.ts#L201), [nested dispatch](../../src/cli.ts#L2474), [auto-attach](../../src/cli.ts#L2584).
 
 | ID | Candidate property | Existing evidence and remaining work |
 | --- | --- | --- |

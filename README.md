@@ -361,7 +361,7 @@ When you upgrade tuistory, the next CLI command detects the version mismatch and
 └───────────────┘                      └────────────────┘
 ```
 
-The restart is **race-safe**: a file lock prevents two concurrent CLI invocations from both trying to restart. The daemon only restarts when the CLI version is **newer** than the running daemon.
+Cooperating CLI clients serialize restart and stop operations with a lifecycle lock. A compatible version observed by the client is reused; an older or unresponsive listener may be replaced. Escalation keeps the initial listener targets and fails if another process takes the port. See the [concurrency checks and remaining limits](docs/verification/lifecycle/README.md).
 
 ### Manual daemon control
 
@@ -521,6 +521,8 @@ The main process owns the session lifetime. Recorded sessions allow up to 200 ms
 The [feature map](docs/feature-map/README.md) links CLI commands and library APIs to source, tests, and candidate formal properties. It includes [Pele statecharts and bounded TLA+ starter models](docs/feature-map/statecharts.md), with explicit assumptions and reproduction commands.
 
 Run `bun scripts/check-feature-map.mjs` to check inventory coverage and local links.
+
+The [lifecycle verification](docs/verification/lifecycle/README.md) separates requirements from implementation models and replays concurrency counterexamples against real processes.
 
 ## Projects using tuistory
 

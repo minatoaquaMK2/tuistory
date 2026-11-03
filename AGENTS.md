@@ -59,6 +59,8 @@ A waiting client can acquire after the previous owner dies, even if no daemon wa
 
 key rule: **a healthy daemon at an equal-or-newer version is never killed.** killing the daemon destroys all in-memory PTY sessions, so a version match (or newer) always reuses the running daemon.
 
+The implemented reuse decision is based on an HTTP observation. The unlocked fast path calls only `getRelayVersion()`; every bind-based occupancy probe runs under the lifecycle lock. A daemon can recover after a failed health observation but before signaling, so the stronger instantaneous-health rule above is not established. See `docs/verification/lifecycle/README.md` for the reproduced gap and finite verification scope.
+
 ### version mismatch / update case
 
 when you publish a new version and run any command with the updated CLI while an OLD daemon is still running:
@@ -76,6 +78,8 @@ direction matters: **old daemon + new CLI ⇒ restart** (new wins); **new daemon
 ### daemon-stop
 
 `runDaemonStopCommand()` acquires the same lifecycle lock before probing. It also treats the port as truth: it signals the IPv4 listener covering the relay address (via `killRelay()`), and prints `No daemon running` only when `probeRelay()` returns `no-listener`. if the port can't be freed it exits non-zero instead of falsely reporting success.
+
+`killRelay()` fixes its allowed PID set at the first listener discovery. Before SIGKILL, it discovers listeners again and refuses if any PID is outside that initial set. A successor occupying the port causes a safe error for both ensure and stop. Numeric PID reuse and the initial health-to-listener observation window remain outside this protection.
 
 ### startup is bind-safe
 

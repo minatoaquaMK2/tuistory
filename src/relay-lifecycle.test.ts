@@ -218,6 +218,90 @@ test('a restart waits for daemon-stop and re-probes after the listener exits', a
 
 const posixTest = process.platform === 'win32' ? test.skip : test
 
+posixTest('a suspended port probe does not become another starter\'s kill target', async () => {
+  const fixture = path.join(directory, 'pause-probe.cjs')
+  const paused = path.join(directory, 'probe-paused')
+  const observed = path.join(directory, 'probe-observed')
+  fs.writeFileSync(fixture, `
+    const fs = require('node:fs');
+    const net = require('node:net');
+    const emit = net.Server.prototype.emit;
+    net.Server.prototype.emit = function(event, ...args) {
+      if (event === 'listening' && process.env.PAUSE_PROBE && this.address()?.port === ${port}) {
+        delete process.env.PAUSE_PROBE;
+        fs.writeFileSync(${JSON.stringify(paused)}, String(process.pid));
+        process.kill(process.pid, 'SIGSTOP');
+      }
+      return emit.call(this, event, ...args);
+    };
+    const kill = process.kill.bind(process);
+    process.kill = (pid, signal) => {
+      if (pid === Number(process.env.PROBE_PID)) {
+        fs.writeFileSync(${JSON.stringify(observed)}, String(signal));
+      }
+      return kill(pid, signal);
+    };
+  `)
+  const preload = process.versions.bun ? '--preload' : '--require'
+  const first = run([preload, fixture, cliPath, 'sessions'], { PAUSE_PROBE: 'yes' })
+  await until(() => fs.existsSync(paused))
+  const second = run([preload, fixture, cliPath, 'sessions'], { PROBE_PID: String(first.child.pid) })
+  await until(() => fs.existsSync(observed), 10000)
+  first.child.kill('SIGCONT')
+  const results = await Promise.all([first.done, second.done])
+  expect({ codes: results.map(result => result.code), signal: first.child.signalCode }).toEqual({ codes: [0, 0], signal: null })
+  expect(fs.readFileSync(observed, 'utf8')).toBe('0')
+}, 20000)
+
+const darwinTest = process.platform === 'darwin' ? test : test.skip
+
+darwinTest.each(['sessions', 'daemon-stop'])('escalation during %s preserves a new daemon and its session', async command => {
+  const fixture = path.join(directory, 'pause-escalation.cjs')
+  const paused = path.join(directory, 'escalation-paused')
+  fs.rmSync(paused, { force: true })
+  fs.writeFileSync(fixture, `
+    const fs = require('node:fs');
+    const cp = require('node:child_process');
+    const { syncBuiltinESMExports } = require('node:module');
+    const { promisify } = require('node:util');
+    const execFile = cp.execFile;
+    let calls = 0;
+    cp.execFile = function(file, ...args) {
+      if (file === '/usr/sbin/lsof' && ++calls === 2) {
+        fs.writeFileSync(${JSON.stringify(paused)}, String(process.pid));
+        process.kill(process.pid, 'SIGSTOP');
+      }
+      return execFile.call(this, file, ...args);
+    };
+    cp.execFile[promisify.custom] = (...args) => new Promise((resolve, reject) => {
+      cp.execFile(...args, (error, stdout, stderr) => error ? reject(error) : resolve({ stdout, stderr }));
+    });
+    syncBuiltinESMExports();
+  `)
+  const old = await versionFixture('{"version":"0.0.0"}', true)
+  const preload = process.versions.bun ? '--preload' : '--require'
+  const replacing = run([preload, fixture, cliPath, command])
+  await until(() => fs.existsSync(paused), 12000)
+  fs.writeFileSync(old.marker + '.release', '')
+  await old.done
+  const successor = run([cliPath, '__tuistory-relay-daemon'])
+  await until(async () => {
+    try { return (await fetch(`http://127.0.0.1:${port}/version`)).ok } catch { return false }
+  })
+  const response = await fetch(`http://127.0.0.1:${port}/cli`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ argv: [process.execPath, cliPath, 'launch', 'cat', '--no-wait', '-s', 'successor-survives'], cwd: root, env }),
+  })
+  expect(await response.json()).toMatchObject({ exitCode: 0 })
+  replacing.child.kill('SIGCONT')
+  const result = await replacing.done
+  expect(successor.child.signalCode).toBeNull()
+  expect(successor.child.exitCode).toBeNull()
+  const sessions = await fetch(`http://127.0.0.1:${port}/sessions`).then(response => response.text())
+  expect(sessions).toContain('successor-survives')
+  expect(result.code).toBe(1)
+}, 25000)
+
 posixTest('a suspended restart cannot be overtaken after ten seconds or destroy the waiting launch', async () => {
   const fixture = await versionFixture('{"version":"0.0.0"}', true)
   const owner = cli('sessions')

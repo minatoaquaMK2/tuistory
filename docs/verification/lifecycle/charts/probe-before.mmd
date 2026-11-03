@@ -1,0 +1,79 @@
+---
+title: "A port probe must not become a kill target"
+---
+stateDiagram-v2
+  state "Legend" as legend {
+    lg0: Breaks CallersSurvive
+    lg1: Path to the CallersSurvive bug
+  }
+  class lg0 breaks
+  class lg1 bugPath
+  s0: Both callers check readiness
+  s1: One caller finished its readiness check
+  s2: Caller holds probe socket#59; peer: check readiness
+  s3: Both callers finished their readiness checks
+  s4: Caller holds probe socket#59; peer: probe without lock
+  s5: Caller holds probe socket#59; peer: wait for lock
+  s6: Lock owner: recheck readiness
+  s7: Caller holds probe socket#59; peer: recheck readiness
+  s8: Lock owner: probe with lock
+  s9: Caller holds probe socket#59; peer: probe with lock
+  s10: Caller holds probe socket#59; peer: look up occupied port
+  s11: Lock owner: start daemon
+  s12: Caller holds probe socket#59; peer: signal selected caller
+  s13: Daemon is ready
+  s14: Lock owner: look up occupied port
+  s15: Caller holds probe socket#59; peer: start daemon
+  s16: Lock owner: signal selected caller
+  s17: A caller was killed
+  s18: Both readiness checks finished
+  [*] --> s0
+  s0 --> s1: continue request
+  s1 --> s2: bind probe socket
+  s1 --> s3: continue request
+  s2 --> s4: continue request
+  s2 --> s1: close probe socket
+  s3 --> s4: bind probe socket
+  s4 --> s5: continue request
+  s4 --> s3: close probe socket
+  s1 --> s6: acquire lifecycle lock
+  s5 --> s7: acquire lifecycle lock
+  s5 --> s3: close probe socket
+  s6 --> s8: continue request
+  s3 --> s5: bind probe socket
+  s3 --> s6: acquire lifecycle lock
+  s7 --> s9: continue request
+  s7 --> s6: close probe socket
+  s8 --> s2: bind probe socket
+  s6 --> s7: bind probe socket
+  s2 --> s11: close probe socket
+  s9 --> s10: continue request
+  s9 --> s8: close probe socket
+  s8 --> s9: bind probe socket
+  s8 --> s4: bind probe socket
+  s4 --> s11: close probe socket
+  s10 --> s12: continue request
+  s10 --> s14: close probe socket
+  s11 --> s13: start service
+  s8 --> s5: bind probe socket
+  s5 --> s11: close probe socket
+  s12 --> s16: close probe socket
+  s12 --> s17: signal the probe owner
+  s14 --> s16: continue request
+  s11 --> s15: bind probe socket
+  s15 --> s11: close probe socket
+  s16 --> s11: continue request
+  s16 --> s17: signal the probe owner
+  s13 --> s18: continue request
+  classDef breaks fill:#ffecee,stroke:#e72e3b,stroke-width:2.5px,color:#cd2834
+  class s0 bugPath
+  class s1 bugPath
+  class s3 bugPath
+  class s4 bugPath
+  class s5 bugPath
+  class s7 bugPath
+  class s9 bugPath
+  class s10 bugPath
+  class s12 bugPath
+  class s17 breaks
+  class s17 bugPath
