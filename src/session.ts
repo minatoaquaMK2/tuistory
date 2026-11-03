@@ -273,6 +273,7 @@ export class Session {
   readonly startedAt: number = Date.now()
   private exitListeners: Array<(info: { exitCode: number; signal: number }) => void> = []
   private closeListeners: Array<(reason: string) => void> = []
+  private closeReason: string | undefined
 
   constructor(options: LaunchOptions)
   constructor(options: InternalLaunchOptions) {
@@ -411,7 +412,8 @@ export class Session {
       this.outputState = drain.kind === 'eof' ? 'eof' : 'incomplete'
       this.drainResolvers()
       if (drain.kind === 'eof') {
-        await this.recorder?.finishProcess(info)
+        const status = await this.recorder?.finishProcess(info)
+        if (status?.kind === 'partial') this.outputState = 'incomplete'
       } else {
         const aborted = this.recorder?.abort(drain.reason)
         this.disposePty()
@@ -455,6 +457,7 @@ export class Session {
    * Multiple subscribers are supported (for attach clients, future grid view).
    */
   subscribe(callback: (data: string) => void): () => void {
+    if (this.closing || this.closed) return () => {}
     this.dataSubscribers.add(callback)
     return () => { this.dataSubscribers.delete(callback) }
   }
@@ -490,9 +493,14 @@ export class Session {
    * "session-closed" (user ran `tuistory close`) from "daemon-shutdown", etc.
    */
   onClosing(callback: (reason: string) => void): () => void {
-    this.closeListeners.push(callback)
+    if (this.closeReason !== undefined) {
+      try { callback(this.closeReason) } catch {}
+      return () => {}
+    }
+    const listener: typeof callback = (reason) => callback(reason)
+    this.closeListeners.push(listener)
     return () => {
-      const index = this.closeListeners.indexOf(callback)
+      const index = this.closeListeners.indexOf(listener)
       if (index !== -1) this.closeListeners.splice(index, 1)
     }
   }
@@ -1090,6 +1098,7 @@ export class Session {
   closeAsync(reason: string = 'session-closed'): Promise<void> {
     if (!this.closePromise) {
       this.closing = true
+      this.closeReason = reason
       this.closePromise = Promise.resolve().then(() => this.recorder ? this.finishClose() : undefined)
       clearTimeout(this.idleTimer)
       // Close listeners may send a final message through attached subscribers.
@@ -1116,6 +1125,7 @@ export class Session {
         }),
       ])
     } catch (error) {
+      this.outputState = 'incomplete'
       await this.recorder?.abort(`Session close incomplete: ${String(error)}`)
       throw error
     } finally {

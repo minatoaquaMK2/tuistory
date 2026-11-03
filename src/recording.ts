@@ -74,6 +74,8 @@ export class Recorder implements RecordingHandle {
   private cutoffUs: bigint | undefined
   private fileIdentity: { dev: bigint; ino: bigint } | undefined
   private linked = false
+  private linkPromise: Promise<void> | undefined
+  private cleanupPromise: Promise<void> | undefined
 
   private constructor(
     private file: FileHandle,
@@ -250,8 +252,8 @@ export class Recorder implements RecordingHandle {
       await this.file.close()
       if (this.state.kind === 'finishing') {
         const extent = this.state.extent
-        await link(this.partialPath, this.path)
-        this.linked = true
+        this.linkPromise = link(this.partialPath, this.path).then(() => { this.linked = true })
+        await this.linkPromise
         if (this.status().kind === 'partial') {
           await this.cleanupPublished()
           return this.status()
@@ -275,13 +277,17 @@ export class Recorder implements RecordingHandle {
   }
 
   private async cleanupPublished(): Promise<void> {
+    await this.linkPromise?.catch(() => {})
     if (!this.linked) return
-    try {
-      const current = await lstat(this.path, { bigint: true })
-      if (current.dev !== this.fileIdentity?.dev || current.ino !== this.fileIdentity.ino) return
-      await unlink(this.path)
-      this.linked = false
-    } catch {}
+    this.cleanupPromise ??= (async () => {
+      try {
+        const current = await lstat(this.path, { bigint: true })
+        if (current.dev !== this.fileIdentity?.dev || current.ino !== this.fileIdentity.ino) return
+        await unlink(this.path)
+        this.linked = false
+      } catch {}
+    })()
+    await this.cleanupPromise
   }
 
   private async complete(): Promise<RecordingStatus> {
@@ -291,11 +297,13 @@ export class Recorder implements RecordingHandle {
         this.finalize(),
         new Promise<RecordingStatus>((resolve) => {
           timer = setTimeout(() => {
-            if (this.state.kind !== 'saved') {
-              this.state = { kind: 'partial', reason: 'Recording finalization exceeded 5000ms; publication is unconfirmed' }
-              void this.cleanupPublished()
-            }
-            resolve(this.status())
+            void (async () => {
+              if (this.state.kind !== 'saved') {
+                this.state = { kind: 'partial', reason: 'Recording finalization exceeded 5000ms; publication is unconfirmed' }
+                await this.cleanupPublished()
+              }
+              resolve(this.status())
+            })()
           }, 5000)
         }),
       ])

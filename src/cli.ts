@@ -1881,6 +1881,7 @@ async function startRelayServer() {
   })
 
   app.get('/version', (c) => {
+    if (shuttingDown) return c.json({ error: 'Relay is shutting down' }, 503)
     return c.json({ version: VERSION })
   })
 
