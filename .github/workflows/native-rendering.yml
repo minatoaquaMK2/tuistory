@@ -1,0 +1,43 @@
+name: Native rendering
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  render:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install FFmpeg
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install ffmpeg
+          else
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun test src/recording.test.ts
+      - run: bun run test:node src/recording.test.ts
+      - name: Test the installed package
+        run: |
+          archive="$(bun pm pack --ignore-scripts --quiet --destination "$RUNNER_TEMP")"
+          mkdir "$RUNNER_TEMP/native consumer"
+          cd "$RUNNER_TEMP/native consumer"
+          echo '{"private":true,"type":"module"}' > package.json
+          bun add "$archive"
+          bun "$GITHUB_WORKSPACE/scripts/verify-native-package.mjs"
+          node "$GITHUB_WORKSPACE/scripts/verify-native-package.mjs"
