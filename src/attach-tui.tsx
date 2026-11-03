@@ -9,10 +9,11 @@
 // so we use the native WebSocket API available in Bun's global scope.
 
 import { createCliRenderer, TextAttributes, type MouseEvent as OpenTUIMouseEvent } from '@opentui/core'
-import { createRoot, useKeyboard, useRenderer, useTerminalDimensions, useOnResize, extend } from '@opentui/react'
+import { createRoot, useKeyboard, usePaste, useRenderer, useTerminalDimensions, useOnResize, extend } from '@opentui/react'
 import { GhosttyTerminalRenderable } from 'ghostty-opentui/terminal-buffer'
 import { useRef, useState, useEffect, useCallback } from 'react'
 import { spawn } from 'child_process'
+import { decodeAttachServerMessage } from './attach-protocol.js'
 
 function copyToClipboard(text: string): void {
   const cmd = process.platform === 'darwin' ? 'pbcopy'
@@ -109,13 +110,24 @@ function AttachView({ sessionName, ws, onDetach, onKill }: AttachViewProps) {
   const { width, height } = useTerminalDimensions()
   const [status, setStatus] = useState<string | null>(null)
   const [processExited, _setProcessExited] = useState(false)
+  const pendingCtrlKey = useRef<{
+    key: 'c' | 'x'
+    sequence: string
+    timeout: ReturnType<typeof setTimeout>
+  } | null>(null)
+  const clearPendingCtrlKey = useCallback(() => {
+    if (!pendingCtrlKey.current) return
+    clearTimeout(pendingCtrlKey.current.timeout)
+    pendingCtrlKey.current = null
+  }, [])
   // Ref mirror of processExited so the onClose handler (captured in a
   // useEffect with [ws] deps) always sees the latest value.
   const processExitedRef = useRef(false)
   const setProcessExited = useCallback((v: boolean) => {
     processExitedRef.current = v
+    if (v) clearPendingCtrlKey()
     _setProcessExited(v)
-  }, [])
+  }, [clearPendingCtrlKey])
   // Track the close reason sent by the daemon so we can show a specific
   // message instead of generic "Connection closed".
   const closeReasonRef = useRef<string | null>(null)
@@ -124,58 +136,77 @@ function AttachView({ sessionName, ws, onDetach, onKill }: AttachViewProps) {
   const termCols = Math.max(20, width)
   const termRows = Math.max(5, height - 1)
 
-  // Send initial attach handshake + resize
-  useEffect(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'attach', session: sessionName, cols: termCols, rows: termRows }))
+  const protocol = useRef<'waiting' | 'ready' | 'failed'>('waiting')
+  const queuedInput = useRef<string[]>([])
+  const sendInput = useCallback((data: string) => {
+    if (processExitedRef.current) return
+    if (protocol.current === 'waiting') {
+      queuedInput.current.push(data)
+    } else if (protocol.current === 'ready' && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'input', data }))
     }
-  }, [])
+  }, [ws])
 
-  // Handle incoming WebSocket messages
   useEffect(() => {
+    protocol.current = 'waiting'
+    const failProtocol = (message: string) => {
+      clearTimeout(timeout)
+      protocol.current = 'failed'
+      queuedInput.current = []
+      setStatus(message)
+      setProcessExited(true)
+      ws.close(1002, 'Attach protocol error')
+    }
+    const timeout = setTimeout(() => failProtocol('Attach protocol negotiation timed out'), 5000)
     const onMessage = (event: MessageEvent) => {
-      const data = event.data
-      const str = typeof data === 'string' ? data : String(data)
-
-      // Check for JSON control messages (exit, error, closing)
-      if (str.startsWith('{')) {
-        try {
-          const msg = JSON.parse(str)
-          if (msg.type === 'exit') {
-            const signalName = msg.signal ? SIGNAL_NAMES[msg.signal] || `signal ${msg.signal}` : null
-            let text = `Process exited (code ${msg.exitCode}`
-            if (signalName) text += `, ${signalName}`
-            text += ')'
-            setStatus(text)
-            setProcessExited(true)
-            return
-          }
-          if (msg.type === 'closing') {
-            // Daemon is about to close this session. Store the reason so the
-            // onClose handler can also reference it, and update the TUI
-            // immediately (don't rely solely on onClose firing).
-            const closeReason = msg.reason ?? 'unknown'
-            closeReasonRef.current = closeReason
-            setStatus(formatCloseReason(closeReason))
-            setProcessExited(true)
-            return
-          }
-          if (msg.type === 'error') {
-            setStatus(`Error: ${msg.message}`)
-            return
-          }
-        } catch {
-          // Not JSON, treat as PTY data below
-        }
+      if (protocol.current === 'failed') return
+      const message = decodeAttachServerMessage(String(event.data))
+      if (!message) {
+        failProtocol('Invalid attach protocol message')
+        return
       }
-
-      // Feed PTY data to ghostty terminal renderer
-      if (termRef.current) {
-        termRef.current.feed(str)
+      if (protocol.current === 'waiting') {
+        if (message.type === 'error') {
+          failProtocol(`Error: ${message.message}`)
+          return
+        }
+        if (message.type !== 'attached') {
+          failProtocol('Daemon does not support attach protocol 2; restart the daemon')
+          return
+        }
+        clearTimeout(timeout)
+        protocol.current = 'ready'
+        for (const data of queuedInput.current.splice(0)) sendInput(data)
+        return
+      }
+      switch (message.type) {
+        case 'attached': return
+        case 'data':
+          termRef.current?.feed(message.data)
+          return
+        case 'exit': {
+          const signalName = message.signal ? SIGNAL_NAMES[message.signal] || `signal ${message.signal}` : null
+          let text = `Process exited (code ${message.exitCode}`
+          if (signalName) text += `, ${signalName}`
+          setStatus(text + ')')
+          setProcessExited(true)
+          return
+        }
+        case 'closing':
+          closeReasonRef.current = message.reason
+          setStatus(formatCloseReason(message.reason))
+          setProcessExited(true)
+          return
+        case 'error':
+          setStatus(`Error: ${message.message}`)
+          return
       }
     }
 
     const onClose = (event: CloseEvent) => {
+      clearTimeout(timeout)
+      protocol.current = 'failed'
+      queuedInput.current = []
       // If the process already exited and the connection closes normally,
       // the exit message is already displayed — nothing more to show.
       if (processExitedRef.current) return
@@ -209,12 +240,18 @@ function AttachView({ sessionName, ws, onDetach, onKill }: AttachViewProps) {
 
     ws.addEventListener('message', onMessage)
     ws.addEventListener('close', onClose)
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'attach', protocol: 2, session: sessionName, cols: termCols, rows: termRows }))
+    } else {
+      failProtocol('Attach connection closed before negotiation')
+    }
 
     return () => {
+      clearTimeout(timeout)
       ws.removeEventListener('message', onMessage)
       ws.removeEventListener('close', onClose)
     }
-  }, [ws])
+  }, [ws, sessionName, sendInput])
 
   // Handle resize — tell both the terminal component and the relay
   useOnResize((newWidth, newHeight) => {
@@ -224,12 +261,6 @@ function AttachView({ sessionName, ws, onDetach, onKill }: AttachViewProps) {
       ws.send(JSON.stringify({ type: 'resize', cols: newCols, rows: newRows }))
     }
   })
-
-  const pendingCtrlKey = useRef<{
-    key: 'c' | 'x'
-    sequence: string
-    timeout: ReturnType<typeof setTimeout>
-  } | null>(null)
 
   // Copy-on-select: when user finishes a mouse drag selection, copy to clipboard
   const handleCopyOnSelect = useCallback(() => {
@@ -242,20 +273,12 @@ function AttachView({ sessionName, ws, onDetach, onKill }: AttachViewProps) {
     renderer.clearSelection()
   }, [renderer])
 
-  const clearPendingCtrlKey = useCallback(() => {
-    if (!pendingCtrlKey.current) return
-    clearTimeout(pendingCtrlKey.current.timeout)
-    pendingCtrlKey.current = null
-  }, [])
-
   const flushPendingCtrlKey = useCallback(() => {
     const pending = pendingCtrlKey.current
     if (!pending) return
     clearPendingCtrlKey()
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(pending.sequence)
-    }
-  }, [clearPendingCtrlKey, ws])
+    sendInput(pending.sequence)
+  }, [clearPendingCtrlKey, sendInput])
 
   useEffect(() => {
     return () => clearPendingCtrlKey()
@@ -263,8 +286,8 @@ function AttachView({ sessionName, ws, onDetach, onKill }: AttachViewProps) {
 
   useKeyboard((key) => {
     // When process has exited, single Ctrl+C detaches (no double-press needed)
-    if (processExited && key.ctrl && key.name === 'c') {
-      onDetach()
+    if (processExitedRef.current) {
+      if (key.ctrl && key.name === 'c') onDetach()
       return
     }
 
@@ -292,9 +315,7 @@ function AttachView({ sessionName, ws, onDetach, onKill }: AttachViewProps) {
           const sequence = pendingCtrlKey.current.sequence
           pendingCtrlKey.current = null
           setStatus(null)
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(sequence)
-          }
+          sendInput(sequence)
         }, DOUBLE_CTRL_TIMEOUT_MS),
       }
       return
@@ -303,9 +324,12 @@ function AttachView({ sessionName, ws, onDetach, onKill }: AttachViewProps) {
     flushPendingCtrlKey()
 
     // Forward all other input to the relay PTY
-    if (ws.readyState === WebSocket.OPEN && key.sequence) {
-      ws.send(key.sequence)
-    }
+    if (key.sequence) sendInput(key.sequence)
+  })
+
+  usePaste(event => {
+    flushPendingCtrlKey()
+    sendInput(new TextDecoder('utf-8', { ignoreBOM: true }).decode(event.bytes))
   })
 
   return (

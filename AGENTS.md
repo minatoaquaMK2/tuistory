@@ -36,35 +36,26 @@ probeRelay()
 
 ### ensureRelayRunning flow
 
-every "the daemon is not what we want" case (stale version, wedged, orphan) collapses into ONE kill-and-spawn transition, guarded by a restart-lock file so two concurrent clients can't kill each other's daemons.
+every replacement runs under `withRelayLifecycleLock()` from `src/relay-lock.ts`. `daemon-stop` takes the same lock. Each caller creates a unique PID-and-random-token directory under `/tmp/tuistory/lifecycle-PORT`, publishes a ticket atomically, then scans again before entering. A live owner never expires. Only an `ESRCH` liveness result permits cleanup of another caller's unique directory. Permission errors and PID reuse can cause a safe timeout. The shared parent stays in place; the lock assumes a coherent local filesystem.
 
 ```
 ensureRelayRunning()
    │
-   ├─ probeRelay()
-   │     └─ healthy && version >= ours ?  ──────► YES: use it, return (fast path)
-   │                                               (a newer daemon is fine; never downgrade)
-   ▼ NO
-   acquireRestartLock()
-   │     ├─ lock NOT acquired (another client is fixing it)
-   │     │        └─ waitForRelay(15s) ──► ready ? ─► return │ timeout ─► fail
-   │     │
-   │     └─ lock acquired ▼
-   │         re-probe under lock (winner may have already upgraded it)
-   │           └─ healthy && version >= ours ?  ────────► YES: return
-   │         ▼ NO
-   │         current.kind ?
-   │           ├─ healthy (older)        ─► log "version mismatch ... restarting"
-   │           ├─ occupied-unresponsive  ─► log "occupied but not answering ... wedged"
-   │           └─ no-listener            ─► (skip kill, nothing owns the port)
-   │         │
-   │         ├─ if not no-listener: killRelay() ──► returns portFreed
-   │         │        └─ portFreed === false ? ──► fail (port stuck, do not spawn)
-   │         │
-   │         ├─ spawnRelayServer()  (detached, TUISTORY_PORT pinned)
-   │         └─ waitForRelay(5s, ours) ──► ready ? ─► return  │ timeout ─► fail
-   │     finally: releaseRestartLock()
+   ├─ probeRelay(): healthy && version >= ours? ──► reuse, return
+   ▼
+   withRelayLifecycleLock()  (wait up to 15 seconds)
+   │   ├─ timeout ──► fail without stealing a live owner's lock
+   │   └─ acquired
+   │       ├─ re-probe healthy && version >= ours? ──► reuse
+   │       ├─ occupied? ──► killRelay(); require free port
+   │       ├─ spawnRelayServer() with pinned TUISTORY_PORT
+   │       └─ waitForRelay(5s)
+   │           ├─ ready ──► return
+   │           └─ timeout ──► terminate own spawned child, then fail
+   └─ finally remove only this caller's unique contender directory
 ```
+
+A waiting client can acquire after the previous owner dies, even if no daemon was started. Legacy `restart-PORT.lock` files are no longer used. Old binaries do not participate in the new mutex; healthy older clients still reuse a newer daemon. An abruptly killed starter can leave a detached child that has not bound yet, so the lock alone does not cancel abandoned pending starts.
 
 key rule: **a healthy daemon at an equal-or-newer version is never killed.** killing the daemon destroys all in-memory PTY sessions, so a version match (or newer) always reuses the running daemon.
 
@@ -74,7 +65,7 @@ when you publish a new version and run any command with the updated CLI while an
 
 1. `probeRelay()` returns `healthy(oldVersion)`. `isUsableVersion(oldVersion)` is `oldVersion >= ourVersion`, which is false, so the fast path is skipped.
 2. the client takes the restart lock, logs `Relay server version mismatch (server: X, client: Y), restarting...`.
-3. `killRelay()` SIGTERMs the old daemon by PID → it runs `gracefulShutdown()`: **closes every session, kills their child process groups, unlinks its PID file**. then a port-kill fallback covers orphans, and it waits for the port to be free.
+3. `killRelay()` discovers the current TCP listener by port and sends SIGTERM. The daemon runs `gracefulShutdown()`: **closes every session, kills their child process groups, unlinks its PID file**. It waits for the port to be free and re-resolves the listener before SIGKILL escalation. PID-file contents never authorize a signal. Listener discovery filters the IPv4 loopback or wildcard TCP endpoint. macOS uses system lsof, Linux uses procfs, and Windows uses system netstat. Windows signals do not provide POSIX graceful-shutdown parity.
 4. `spawnRelayServer()` starts a fresh daemon on the same port; it writes the PID file only on `listening`.
 5. `waitForRelay(5s, ourVersion)` confirms the new daemon answers with the new version, then the command is forwarded.
 
@@ -84,11 +75,11 @@ direction matters: **old daemon + new CLI ⇒ restart** (new wins); **new daemon
 
 ### daemon-stop
 
-`runDaemonStopCommand()` also treats the port as truth: it stops whatever holds the port (via `killRelay()`), and prints `No daemon running` only when `probeRelay()` returns `no-listener`. if the port can't be freed it exits non-zero instead of falsely reporting success.
+`runDaemonStopCommand()` acquires the same lifecycle lock before probing. It also treats the port as truth: it signals the IPv4 listener covering the relay address (via `killRelay()`), and prints `No daemon running` only when `probeRelay()` returns `no-listener`. if the port can't be freed it exits non-zero instead of falsely reporting success.
 
 ### startup is bind-safe
 
-`startRelayServer()` builds the server with `createAdaptorServer()` and attaches `error` / `listening` handlers **before** calling `listen()`. `@hono/node-server`'s `serve()` helper binds with no error handler, so a lost bind race used to surface as an unhandled `'error'` event and crash with a confusing `EADDRINUSE` stack. now a daemon that loses the race exits cleanly (code 0); any other listen error exits 1. the PID file is written only after a successful bind and removed only by its owner, so a failed-to-bind daemon can never clobber the real listener's PID file.
+`startRelayServer()` builds the server with `createAdaptorServer()` and attaches `error` / `listening` handlers **before** calling `listen()`. `@hono/node-server`'s `serve()` helper binds with no error handler, so a lost bind race used to surface as an unhandled `'error'` event and crash with a confusing `EADDRINUSE` stack. now a daemon that loses the race exits cleanly (code 0); any other listen error exits 1. the PID file is written only after a successful bind and removed only by its owner, so a failed-to-bind daemon never writes the real listener's PID file. The file is diagnostic; reading then unlinking it is not an atomic ownership operation.
 
 ## prefer `--` over `launch`
 

@@ -1,4 +1,4 @@
-import { PersistentTerminal, StyleFlags, type TerminalData, ptyToText } from 'ghostty-opentui'
+import { PersistentTerminal, StyleFlags, type TerminalData, type TerminalLine, ptyToJson, ptyToText } from 'ghostty-opentui'
 import { spawn, type IPty } from 'tuistory/pty'
 import { spawnNative, type RecordedPty, type PtyDrain } from './pty-native.js'
 import fs from 'node:fs'
@@ -24,6 +24,34 @@ export type RecordedLaunchOptions = LaunchOptions & { record?: RecordOptions }
 const preparedRecorder = Symbol('preparedRecorder')
 type InternalLaunchOptions = LaunchOptions & { [preparedRecorder]?: Recorder }
 const OUTPUT_TAIL_TIMEOUT_MS = 200
+function terminalColumn(line: TerminalLine, textIndex: number): number {
+  let column = 0
+  for (const span of line.spans) {
+    if (textIndex >= span.text.length) {
+      textIndex -= span.text.length
+      column += span.width
+      continue
+    }
+    const prefixWidth = (end: number) => ptyToJson(span.text.slice(0, end), { cols: span.width + 1, rows: 1 })
+      .lines.reduce((width, line) => width + line.spans.reduce((sum, span) => sum + span.width, 0), 0)
+    let start = 0
+    let end = 0
+    for (const character of span.text) {
+      end = start + character.length
+      if (end > textIndex) break
+      start = end
+    }
+    const width = prefixWidth(start)
+    if (prefixWidth(end) > width) return column + width
+    for (const character of [...span.text.slice(0, start)].reverse()) {
+      start -= character.length
+      const previousWidth = prefixWidth(start)
+      if (previousWidth < width) return column + previousWidth
+    }
+    return column
+  }
+  return column
+}
 
 export async function createSession(options: RecordedLaunchOptions, canStart: () => boolean = () => true): Promise<Session> {
   if (options.record && process.platform === 'win32') throw new Error('Terminal recording currently requires a POSIX native PTY')
@@ -442,12 +470,17 @@ export class Session {
   }
 
   /** Register a callback for when the PTY process exits. Fires immediately if already dead. */
-  onExit(callback: (info: { exitCode: number; signal: number }) => void): void {
+  onExit(callback: (info: { exitCode: number; signal: number }) => void): () => void {
     if (this.exitInfo) {
       callback(this.exitInfo)
-      return
+      return () => {}
     }
-    this.exitListeners.push(callback)
+    const listener: typeof callback = (info) => callback(info)
+    this.exitListeners.push(listener)
+    return () => {
+      const index = this.exitListeners.indexOf(listener)
+      if (index !== -1) this.exitListeners.splice(index, 1)
+    }
   }
 
   /**
@@ -568,11 +601,14 @@ export class Session {
         setTimeout(resolve, Math.min(timeout, 20))
         return
       }
-      const t = setTimeout(resolve, timeout)
-      this.idleResolvers.push(() => {
-        clearTimeout(t)
+      const resolver = () => {
+        clearTimeout(timer)
+        const index = this.idleResolvers.indexOf(resolver)
+        if (index !== -1) this.idleResolvers.splice(index, 1)
         resolve()
-      })
+      }
+      const timer = setTimeout(resolver, timeout)
+      this.idleResolvers.push(resolver)
     })
   }
 
@@ -832,11 +868,14 @@ export class Session {
     const regex =
       typeof pattern === 'string'
         ? new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-        : pattern
+        : new RegExp(pattern.source, pattern.flags)
 
     return this.text({
       timeout,
-      waitFor: (text) => regex.test(text),
+      waitFor: (text) => {
+        regex.lastIndex = 0
+        return regex.test(text)
+      },
     })
   }
 
@@ -890,8 +929,8 @@ export class Session {
     while (Date.now() - startTime < timeout) {
       await this.waitIdle({ timeout: 15 })
 
-      const data = this.term.getJson()
-      const matches: Array<{ x: number; y: number; text: string }> = []
+      const data = this.getVisibleTerminalData()
+      const matches: Array<{ textIndex: number; y: number }> = []
 
       for (let y = 0; y < data.lines.length; y++) {
         const line = data.lines[y]
@@ -900,14 +939,13 @@ export class Session {
           lineText += span.text
         }
 
-        let match: RegExpExecArray | null
         const searchRegex = new RegExp(
           regex.source,
           regex.flags.includes('g') ? regex.flags : regex.flags + 'g',
         )
 
-        while ((match = searchRegex.exec(lineText)) !== null) {
-          matches.push({ x: match.index, y, text: match[0] })
+        for (const match of lineText.matchAll(searchRegex)) {
+          if (match[0].length > 0) matches.push({ textIndex: match.index, y })
         }
       }
 
@@ -922,7 +960,7 @@ export class Session {
       }
 
       const target = matches[0]
-      await this.clickAt(target.x, target.y)
+      await this.clickAt(terminalColumn(data.lines[target.y], target.textIndex), target.y)
       return
     }
 

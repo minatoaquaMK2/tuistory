@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import * as errore from 'errore'
 import { goke, GokeProcessExit, type GokeOptions } from 'goke'
@@ -15,6 +15,9 @@ import pc from 'picocolors'
 import { isAgent } from 'std-env'
 import { Session, createSession, type Key, isValidKey, VALID_KEYS } from './session.js'
 import { DEFAULT_RECORDING_QUEUE_BYTES } from './recording.js'
+import { withRelayLifecycleLock } from './relay-lock.js'
+import { findRelayListeners } from './relay-listener.js'
+import { decodeAttachClientMessage, type AttachServerMessage } from './attach-protocol.js'
 
 // Domain errors — errore tagged errors for typed error handling.
 // These replace throw/catch patterns with Error | T return types.
@@ -52,7 +55,7 @@ const LOG_BASE_DIR = os.platform() === 'win32' ? os.tmpdir() : '/tmp'
 const TUISTORY_DIR = path.join(LOG_BASE_DIR, 'tuistory')
 export const LOG_FILE_PATH = process.env.TUISTORY_LOG_FILE_PATH || path.join(TUISTORY_DIR, 'relay-server.log')
 const PID_FILE = path.join(TUISTORY_DIR, `relay-${RELAY_PORT}.pid`)
-const RESTART_LOCK_FILE = path.join(TUISTORY_DIR, `restart-${RELAY_PORT}.lock`)
+const LIFECYCLE_LOCK_DIR = path.join(TUISTORY_DIR, `lifecycle-${RELAY_PORT}`)
 
 const __filename = fileURLToPath(import.meta.url)
 
@@ -1635,7 +1638,14 @@ function createCliWithActions(
   return cli
 }
 
-// Get relay server version (null if not running)
+const versionSchema = z.string().regex(/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/).refine(version => {
+  const withoutBuild = version.split('+')[0]
+  const separator = withoutBuild.indexOf('-')
+  if (separator === -1) return true
+  return withoutBuild.slice(separator + 1).split('.').every(part => !/^[0-9]+$/.test(part) || part === '0' || !part.startsWith('0'))
+})
+const relayVersionSchema = z.object({ version: versionSchema })
+
 async function getRelayVersion(): Promise<string | null> {
   const response = await errore.tryAsync({
     try: () => fetch(`http://127.0.0.1:${RELAY_PORT}/version`, {
@@ -1647,27 +1657,48 @@ async function getRelayVersion(): Promise<string | null> {
   if (!response.ok) return null
 
   const data = await errore.tryAsync({
-    try: () => response.json() as Promise<{ version: string }>,
+    try: async (): Promise<unknown> => response.json(),
     catch: (e) => new RelayConnectionError({ port: String(RELAY_PORT), reason: 'invalid JSON response', cause: e }),
   })
   if (data instanceof Error) return null
 
-  return data.version
+  const parsed = relayVersionSchema.safeParse(data)
+  return parsed.success ? parsed.data.version : null
 }
 
 // Compare two semver versions
 // Returns: negative if v1 < v2, 0 if equal, positive if v1 > v2
 function compareVersions(v1: string, v2: string): number {
-  const parts1 = v1.split('.').map(Number)
-  const parts2 = v2.split('.').map(Number)
-  const len = Math.max(parts1.length, parts2.length)
+  const parse = (version: string) => {
+    const withoutBuild = version.split('+')[0]
+    const separator = withoutBuild.indexOf('-')
+    return separator === -1
+      ? { core: withoutBuild.split('.').map(BigInt), prerelease: [] }
+      : { core: withoutBuild.slice(0, separator).split('.').map(BigInt), prerelease: withoutBuild.slice(separator + 1).split('.') }
+  }
+  const first = parse(v1)
+  const second = parse(v2)
 
-  for (let i = 0; i < len; i++) {
-    const p1 = parts1[i] || 0
-    const p2 = parts2[i] || 0
+  for (let i = 0; i < 3; i++) {
+    const p1 = first.core[i]
+    const p2 = second.core[i]
     if (p1 !== p2) {
-      return p1 - p2
+      return p1 < p2 ? -1 : 1
     }
+  }
+  if (first.prerelease.length === 0) return second.prerelease.length === 0 ? 0 : 1
+  if (second.prerelease.length === 0) return -1
+  for (let i = 0; i < Math.max(first.prerelease.length, second.prerelease.length); i++) {
+    const p1 = first.prerelease[i]
+    const p2 = second.prerelease[i]
+    if (p1 === p2) continue
+    if (p1 === undefined) return -1
+    if (p2 === undefined) return 1
+    const numeric1 = /^[0-9]+$/.test(p1)
+    const numeric2 = /^[0-9]+$/.test(p2)
+    if (numeric1 && numeric2) return BigInt(p1) < BigInt(p2) ? -1 : 1
+    if (numeric1 !== numeric2) return numeric1 ? -1 : 1
+    return p1 < p2 ? -1 : 1
   }
   return 0
 }
@@ -1702,54 +1733,17 @@ async function probeRelay(): Promise<RelayStatus> {
   return { kind: 'no-listener' }
 }
 
-// Kill relay server using PID file (SIGTERM for graceful shutdown).
-// Escalates to SIGKILL if SIGTERM doesn't work, then ALWAYS kills whatever
-// still holds the relay port.
-//
-// Why kill by port unconditionally (not just as a fallback): the PID file
-// only records the daemon that won the race to bind the port. A daemon that
-// lost the bind race, or one whose PID file got clobbered, can still hold the
-// port as an orphan (PPID 1) that the PID-based kill never sees. Without the
-// unconditional port sweep, `tuistory daemon-stop` would print "Daemon
-// stopped" while a zombie daemon kept the port (and its child dev servers)
-// alive — which is exactly the orphan that caused EADDRINUSE on the next
-// launch. So we treat the port itself as the source of truth for "is a
-// daemon still here".
-// Returns true if the relay port is free afterwards, false if something still
-// holds it (caller should treat that as a fatal failure before spawning).
+// PID files are diagnostic only: stale text can name an unrelated live process.
 async function killRelay(): Promise<boolean> {
-  const pid = readPidFile()
-
-  // First, gracefully stop the daemon recorded in the PID file (if any), so it
-  // closes its sessions and child processes before we resort to killing.
-  if (pid !== null) {
-    await killProcessByPid(pid)
+  const signals: Array<'SIGTERM' | 'SIGKILL'> = ['SIGTERM', 'SIGKILL']
+  for (const signal of signals) {
+    if (!await isPortInUse(RELAY_PORT)) return true
+    const listeners = await errore.tryAsync(() => findRelayListeners(RELAY_PORT))
+    if (listeners instanceof Error || listeners.length === 0) return !await isPortInUse(RELAY_PORT)
+    for (const pid of new Set(listeners.map(listener => listener.pid))) errore.try(() => process.kill(pid, signal))
+    if (await waitForPortFree(RELAY_PORT, signal === 'SIGTERM' ? RELAY_FORCE_KILL_DELAY_MS : 5000)) return true
   }
-
-  // Then ensure the port is actually free. If anything still holds it (the
-  // recorded daemon refused to die, or an unrecorded orphan owns it), kill it.
-  if (await isPortInUse(RELAY_PORT)) {
-    const portKill = await errore.tryAsync({
-      try: async () => {
-        const { killPortProcess } = await import('kill-port-process')
-        await killPortProcess(RELAY_PORT)
-      },
-      catch: (e) => new PidFileError({ path: String(RELAY_PORT), reason: 'port-based kill failed', cause: e }),
-    })
-    if (portKill instanceof Error) {
-      // kill-port-process failed — give the OS a beat before re-checking.
-      await new Promise((r) => setTimeout(r, 200))
-    }
-  }
-
-  // Wait for the OS to actually release the socket so a subsequent spawn
-  // doesn't immediately hit EADDRINUSE again.
-  const freed = await waitForPortFree(RELAY_PORT, 5000)
-
-  // Clean up the PID file (it points at a now-dead daemon).
-  errore.try(() => fs.unlinkSync(PID_FILE))
-
-  return freed
+  return false
 }
 
 // Read the PID recorded in the PID file, or null if missing/invalid.
@@ -1765,65 +1759,6 @@ function readPidFile(): number | null {
 function unlinkPidFileIfOwned(): void {
   if (readPidFile() === process.pid) {
     errore.try(() => fs.unlinkSync(PID_FILE))
-  }
-}
-
-// Returns true if the process exited, false if it couldn't be killed.
-async function killProcessByPid(pid: number): Promise<boolean> {
-  const sendResult = errore.try(() => process.kill(pid, 'SIGTERM'))
-  if (sendResult instanceof Error) return true // Process doesn't exist (stale PID)
-
-  const start = Date.now()
-  while (Date.now() - start < RELAY_FORCE_KILL_DELAY_MS) {
-    const alive = errore.try(() => process.kill(pid, 0))
-    if (alive instanceof Error) return true // Process exited
-    await new Promise((r) => setTimeout(r, 100))
-  }
-
-  // Escalate to SIGKILL if SIGTERM didn't work
-  errore.try(() => process.kill(pid, 'SIGKILL'))
-  // SIGKILL always succeeds if process exists; if it throws, process is already dead
-  return true
-}
-
-// Acquire a file lock for daemon restart (prevents two clients racing to kill+restart).
-// Returns true if lock acquired, false if another client is already restarting.
-// Lock payload: "pid:timestamp" — only the lock owner (matching PID) can release it.
-const RESTART_LOCK_STALE_MS = 10000
-
-function acquireRestartLock(): boolean {
-  ensureTuistoryDir()
-
-  const created = errore.try(() => fs.writeFileSync(RESTART_LOCK_FILE, `${process.pid}:${Date.now()}`, { flag: 'wx' }))
-  if (!(created instanceof Error)) return true
-
-  // Lock file exists — check if stale (holder crashed)
-  const content = errore.try(() => fs.readFileSync(RESTART_LOCK_FILE, 'utf-8'))
-  if (content instanceof Error) return false
-
-  const [pidStr, tsStr] = content.split(':')
-  const lockPid = Number(pidStr)
-  const lockTime = Number(tsStr)
-
-  const isStale = Date.now() - lockTime > RESTART_LOCK_STALE_MS
-    || (!isNaN(lockPid) && lockPid > 0 && errore.try(() => process.kill(lockPid, 0)) instanceof Error)
-
-  if (!isStale) return false
-
-  // Stale lock — remove and retry once
-  errore.try(() => fs.unlinkSync(RESTART_LOCK_FILE))
-  const retried = errore.try(() => fs.writeFileSync(RESTART_LOCK_FILE, `${process.pid}:${Date.now()}`, { flag: 'wx' }))
-  return !(retried instanceof Error)
-}
-
-function releaseRestartLock(): void {
-  // Only release if we own the lock (PID matches)
-  const content = errore.try(() => fs.readFileSync(RESTART_LOCK_FILE, 'utf-8'))
-  if (content instanceof Error) return
-
-  const [pidStr] = content.split(':')
-  if (Number(pidStr) === process.pid) {
-    errore.try(() => fs.unlinkSync(RESTART_LOCK_FILE))
   }
 }
 
@@ -1959,113 +1894,119 @@ async function startRelayServer() {
     return c.json(list)
   })
 
-  // WebSocket endpoint for attach — streams PTY data bidirectionally.
-  // Multiple attach clients can connect to the same session simultaneously
-  // (needed for future grid view). Each client subscribes independently.
-  app.get('/attach', upgradeWebSocket((c) => {
-    let unsubscribe: (() => void) | null = null
-    let unsubscribeClosing: (() => void) | null = null
-    let sessionName: string | null = null
+  app.get('/attach', upgradeWebSocket(() => {
+    let framing: 'legacy' | 'v2' | null = null
+    let binding: { session: Session; name: string; dispose: () => void } | undefined
+
+    const disposeBinding = () => {
+      const previous = binding
+      binding = undefined
+      previous?.dispose()
+    }
 
     return {
       onMessage(event, ws) {
         const raw = typeof event.data === 'string' ? event.data : ''
-        // Try parsing as JSON for control messages
-        let parsed: { type: string; session?: string; cols?: number; rows?: number; data?: string } | null = null
-        try { parsed = JSON.parse(raw) } catch {}
+        const message = decodeAttachClientMessage(raw)
+        const send = (message: AttachServerMessage) => {
+          try { ws.send(JSON.stringify(message)) } catch {}
+        }
+        const reject = (reason: string) => {
+          disposeBinding()
+          send({ type: 'error', message: reason })
+          ws.close(1008, 'Attach rejected')
+        }
 
-        if (parsed && parsed.type === 'attach' && parsed.session) {
-          // Initial attach handshake
-          sessionName = parsed.session
-          const session = sessions.get(sessionName)
-          if (!session) {
-            ws.send(JSON.stringify({ type: 'error', message: `Session "${sessionName}" not found` }))
-            ws.close(1008, 'Session not found')
+        if (message?.type === 'attach') {
+          if (message.protocol !== undefined && message.protocol !== 2) {
+            reject('Unsupported attach protocol')
             return
           }
-
-          // Resize PTY to match client terminal if dimensions provided
-          if (parsed.cols && parsed.rows && !session.isDead) {
-            const resized = errore.try(() => session.resize({ cols: parsed.cols!, rows: parsed.rows! }))
-            if (resized instanceof Error) void logger.error(`Failed to resize session "${sessionName}": ${resized.message}`)
+          const requestedFraming = message.protocol === 2 ? 'v2' : framing ?? 'legacy'
+          if (framing !== null && framing !== requestedFraming) {
+            reject('Attach protocol cannot change on an open connection')
+            return
           }
+          const session = sessions.get(message.session)
+          if (!session) {
+            reject(`Session "${message.session}" not found`)
+            return
+          }
+          framing = requestedFraming
+          if (message.cols && message.rows && !session.isDead) {
+            const size = { cols: message.cols, rows: message.rows }
+            const resized = errore.try(() => session.resize(size))
+            if (resized instanceof Error) void logger.error(`Failed to resize session "${message.session}": ${resized.message}`)
+          }
+          if (framing === 'v2') send({ type: 'attached', protocol: 2 })
+          if (binding?.session === session) return
+          disposeBinding()
 
-          // Send all buffered raw output so the client renders the full
-          // terminal history, not just data arriving after attach.
+          let disposed = false
+          const sendOutput = (data: string) => {
+            if (disposed) return
+            if (framing === 'v2') send({ type: 'data', data })
+            else { try { ws.send(data) } catch {} }
+          }
           const buffered = session.getRawOutput()
-          if (buffered) {
-            try { ws.send(buffered) } catch {}
+          if (buffered) sendOutput(buffered)
+          const unsubscribeData = session.subscribe(sendOutput)
+          const unsubscribeExit = session.onExit(info => {
+            if (!disposed) send({ type: 'exit', exitCode: info.exitCode, signal: info.signal })
+          })
+          const unsubscribeClosing = session.onClosing(reason => {
+            if (disposed) return
+            send({ type: 'closing', reason })
+            try { ws.close(1000, reason) } catch {}
+          })
+          binding = {
+            session,
+            name: message.session,
+            dispose() {
+              if (disposed) return
+              disposed = true
+              unsubscribeData()
+              unsubscribeExit()
+              unsubscribeClosing()
+            },
           }
-
-          // Subscribe to new PTY data and forward to WebSocket client
-          unsubscribe = session.subscribe((data) => {
-            try { ws.send(data) } catch {}
-          })
-
-          // Notify client when PTY exits
-          session.onExit((info) => {
-            try {
-              ws.send(JSON.stringify({ type: 'exit', exitCode: info.exitCode, signal: info.signal }))
-            } catch {}
-          })
-
-          // Notify client when session is being closed (before PTY is killed),
-          // so the TUI can distinguish "tuistory close" from external signals.
-          // Also close the WS so the client's onClose fires reliably.
-          unsubscribeClosing = session.onClosing((reason) => {
-            try {
-              ws.send(JSON.stringify({ type: 'closing', reason }))
-              ws.close(1000, reason)
-            } catch {}
-          })
-
-          // If session is already dead, notify immediately
-          if (session.isDead && session.exitInfo) {
-            ws.send(JSON.stringify({ type: 'exit', exitCode: session.exitInfo.exitCode, signal: session.exitInfo.signal }))
-          }
-
-          void logger.log(`Attach client connected to session "${sessionName}"`)
+          void logger.log(`Attach client connected to session "${message.session}"`)
           return
         }
 
-        if (parsed && parsed.type === 'resize' && sessionName) {
-          const session = sessions.get(sessionName)
-          if (session && parsed.cols && parsed.rows && !session.isDead) {
-            const resized = errore.try(() => session.resize({ cols: parsed.cols!, rows: parsed.rows! }))
-            if (resized instanceof Error) void logger.error(`Failed to resize session "${sessionName}": ${resized.message}`)
+        if (!binding) {
+          reject('Attach to a session before sending input')
+          return
+        }
+        const { session, name } = binding
+        if (message?.type === 'resize') {
+          if (message.cols && message.rows && !session.isDead) {
+            const size = { cols: message.cols, rows: message.rows }
+            const resized = errore.try(() => session.resize(size))
+            if (resized instanceof Error) void logger.error(`Failed to resize session "${name}": ${resized.message}`)
           }
           return
         }
-
-        if (parsed && parsed.type === 'kill' && sessionName) {
-          const session = sessions.get(sessionName)
-          if (session) {
-            session.killProcess()
-            void logger.log(`Session "${sessionName}" killed by attach client`)
-          }
+        if (message?.type === 'kill') {
+          session.killProcess()
+          void logger.log(`Session "${name}" killed by attach client`)
           return
         }
-
-        // Raw text input — forward to PTY
-        if (sessionName) {
-          const session = sessions.get(sessionName)
-          if (session && !session.isDead) {
-            const written = errore.try(() => session.writeRaw(raw))
-            if (written instanceof Error) void logger.error(`Failed to write to session "${sessionName}": ${written.message}`)
-          }
+        if (framing === 'v2' && message?.type !== 'input') {
+          reject('Expected a framed attach input message')
+          return
+        }
+        const input = framing === 'v2' && message?.type === 'input' ? message.data : raw
+        if (!session.isDead) {
+          const written = errore.try(() => session.writeRaw(input))
+          if (written instanceof Error) void logger.error(`Failed to write to session "${name}": ${written.message}`)
         }
       },
       onClose() {
-        if (unsubscribe) unsubscribe()
-        if (unsubscribeClosing) unsubscribeClosing()
-        if (sessionName) {
-          void logger.log(`Attach client disconnected from session "${sessionName}"`)
-        }
+        if (binding) void logger.log(`Attach client disconnected from session "${binding.name}"`)
+        disposeBinding()
       },
-      onError() {
-        if (unsubscribe) unsubscribe()
-        if (unsubscribeClosing) unsubscribeClosing()
-      },
+      onError: disposeBinding,
     }
   }))
 
@@ -2138,8 +2079,6 @@ async function startRelayServer() {
   })
 
   server.on('listening', () => {
-    // Only the daemon that successfully bound the port writes the PID file, so
-    // killRelay() always targets the real listener.
     ensureTuistoryDir()
     const pidWrite = errore.try(() => fs.writeFileSync(PID_FILE, String(process.pid)))
     if (pidWrite instanceof Error) {
@@ -2230,7 +2169,7 @@ const dummyLogger: Logger = {
 }
 
 // Spawn a new relay server in background
-function spawnRelayServer(): void {
+async function spawnRelayServer(): Promise<ChildProcess> {
   const isTs = __filename.endsWith('.ts')
   const execPath = isTs ? 'bun' : process.execPath
 
@@ -2251,7 +2190,12 @@ function spawnRelayServer(): void {
     // an outer tuistory session can make the daemon bind to the wrong port.
     env: { ...process.env, TUISTORY_PORT: String(RELAY_PORT) },
   })
+  await new Promise<void>((resolve, reject) => {
+    serverProcess.once('spawn', resolve)
+    serverProcess.once('error', reject)
+  })
   serverProcess.unref()
+  return serverProcess
 }
 
 // Print a relay error with log tail and exit. Never returns.
@@ -2279,39 +2223,41 @@ async function ensureRelayRunning(): Promise<void> {
   const status = await probeRelay()
   if (status.kind === 'healthy' && isUsableVersion(status.version)) return
 
-  // Only one client performs the kill+spawn transition at a time.
-  if (!acquireRestartLock()) {
-    // Another client is already fixing the daemon; just wait for it.
-    if (await waitForRelay(15000, VERSION)) return
-    failRelay(new RelayStartError({ action: 'start', reason: `timed out waiting for another client to start relay v${VERSION}` }))
-  }
-
   try {
-    // Re-probe under the lock — the previous lock holder may have already
-    // started a good daemon while we were blocked acquiring the lock.
-    const current = await probeRelay()
-    if (current.kind === 'healthy' && isUsableVersion(current.version)) return
+    await withRelayLifecycleLock({ directory: LIFECYCLE_LOCK_DIR }, async () => {
+      // Re-probe under the lock — the previous lock holder may have already
+      // started a good daemon while we were blocked acquiring the lock.
+      const current = await probeRelay()
+      if (current.kind === 'healthy' && isUsableVersion(current.version)) return
 
-    // Tear down any unhealthy owner of the port. A newer healthy daemon would
-    // have returned above, so reaching here with 'healthy' means it's stale.
-    if (current.kind === 'healthy') {
-      console.error(pc.yellow(`Relay server version mismatch (server: ${current.version}, client: ${VERSION}), restarting...`))
-    } else if (current.kind === 'occupied-unresponsive') {
-      console.error(pc.yellow(`Relay port ${RELAY_PORT} is occupied but not answering; replacing wedged daemon...`))
-    }
-    if (current.kind !== 'no-listener') {
-      const portFreed = await killRelay()
-      if (!portFreed) {
-        failRelay(new RelayStartError({ action: 'restart', reason: `port ${RELAY_PORT} still in use after killing old daemon` }))
+      // Tear down any unhealthy owner of the port. A newer healthy daemon would
+      // have returned above, so reaching here with 'healthy' means it's stale.
+      if (current.kind === 'healthy') {
+        console.error(pc.yellow(`Relay server version mismatch (server: ${current.version}, client: ${VERSION}), restarting...`))
+      } else if (current.kind === 'occupied-unresponsive') {
+        console.error(pc.yellow(`Relay port ${RELAY_PORT} is occupied but not answering; replacing wedged daemon...`))
       }
-    }
+      if (current.kind !== 'no-listener') {
+        const portFreed = await killRelay()
+        if (!portFreed) {
+          throw new RelayStartError({ action: 'restart', reason: `port ${RELAY_PORT} still in use after killing old daemon` })
+        }
+      }
 
-    spawnRelayServer()
-    if (!await waitForRelay(5000, VERSION)) {
-      failRelay(new RelayStartError({ action: 'start', reason: `timed out waiting for relay v${VERSION} on port ${RELAY_PORT}` }))
-    }
-  } finally {
-    releaseRestartLock()
+      const serverProcess = await spawnRelayServer()
+      if (!await waitForRelay(5000, VERSION)) {
+        if (serverProcess.exitCode === null && serverProcess.signalCode === null) {
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(() => serverProcess.kill('SIGKILL'), RELAY_FORCE_KILL_DELAY_MS)
+            serverProcess.once('close', () => { clearTimeout(timer); resolve() })
+            serverProcess.kill('SIGTERM')
+          })
+        }
+        throw new RelayStartError({ action: 'start', reason: `timed out waiting for relay v${VERSION} on port ${RELAY_PORT}` })
+      }
+    })
+  } catch (error) {
+    failRelay(new RelayStartError({ action: 'start', reason: errorReason(error), cause: error }))
   }
 }
 
@@ -2429,20 +2375,21 @@ async function runAttachCommand(options: { session?: string }) {
 }
 
 async function runDaemonStopCommand() {
-  // The port is the source of truth, not /version: a wedged or orphaned daemon
-  // holds the port without answering HTTP, and it must still be stopped.
-  const status = await probeRelay()
-  if (status.kind === 'no-listener') {
-    console.log('No daemon running')
-    return
+  try {
+    await withRelayLifecycleLock({ directory: LIFECYCLE_LOCK_DIR }, async () => {
+      const status = await probeRelay()
+      if (status.kind === 'no-listener') {
+        console.log('No daemon running')
+        return
+      }
+      if (!await killRelay()) {
+        throw new RelayStartError({ action: 'stop', reason: `port ${RELAY_PORT} is still in use` })
+      }
+      console.log('Daemon stopped')
+    })
+  } catch (error) {
+    failRelay(new RelayStartError({ action: 'stop', reason: errorReason(error), cause: error }))
   }
-
-  const portFreed = await killRelay()
-  if (!portFreed) {
-    console.error(pc.red(`Failed to stop daemon: port ${RELAY_PORT} is still in use`))
-    process.exit(1)
-  }
-  console.log('Daemon stopped')
 }
 
 // CLI thin client - forwards to relay

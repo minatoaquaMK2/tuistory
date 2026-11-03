@@ -32,7 +32,7 @@ async function runCli(args: string[], options: { cwd?: string; env?: Record<stri
 // but never replies (simulating a wedged/orphaned daemon). Must be a distinct
 // process so killRelay()'s port-based SIGKILL targets it, not the test runner.
 function spawnPortBlocker(port: number) {
-  const code = `require('net').createServer(()=>{}).listen(${port},'127.0.0.1',()=>process.stdout.write('BOUND\\n'))`
+  const code = `require('net').createServer(socket=>socket.on('error',()=>{})).listen(${port},'127.0.0.1',()=>process.stdout.write('BOUND\\n'))`
   return spawn(['node', '-e', code], { stdout: 'pipe', stderr: 'pipe' })
 }
 
