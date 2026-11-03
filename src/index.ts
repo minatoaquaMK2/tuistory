@@ -22,5 +22,5 @@ export async function launchTerminal(options: LaunchTerminalOptions): Promise<Se
 }
 
 export type { RecordOptions, RecordingHandle, RecordingStatus } from './recording.js'
-export { exportRecording, renderTerminalImage, type ExportRecordingOptions } from './recording.js'
+export { exportRecording, renderTerminalImage, type ExportRecordingOptions, type ScreenshotOptions } from './recording.js'
 export type ExportRecordingResult = Awaited<ReturnType<typeof import('./recording.js').exportRecording>>

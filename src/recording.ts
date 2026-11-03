@@ -7,7 +7,6 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { PersistentTerminal, StyleFlags, type TerminalData, type TerminalLine, type TerminalSpan } from 'ghostty-opentui'
-import type { RenderImageOptions } from 'ghostty-opentui/image'
 import wcwidth from 'wcwidth'
 import { z } from 'zod'
 
@@ -356,7 +355,10 @@ const MAX_EVENTS = 20_000
 const MAX_LINES = 50_000
 const MAX_SOURCE_SECONDS = 24 * 60 * 60
 const MAX_FRAMES = 108_000
-const MAX_PIXELS = 4_000_000
+const RENDER_LIMITS = {
+  png: { maxPixels: 16_777_216, maxSide: 16_384 },
+  rgba: { maxPixels: 4_000_000, maxSide: 16_384 },
+}
 const MAX_PIXEL_FRAMES = 20_000_000_000
 const MAX_SCROLLBACK_CELLS = 2_000_000
 const ENCODER_TIMEOUT = 30_000
@@ -511,7 +513,8 @@ export function planRecording(recording: ParsedRecording, options: Omit<ExportRe
   if (!Number.isFinite(frames) || frames > MAX_FRAMES || videoTo - videoFrom > 3600) {
     throw new Error('Export exceeds the one hour or 108000 frame limit')
   }
-  if (width * height > MAX_PIXELS || width * height * frames > MAX_PIXEL_FRAMES) {
+  validateCanvas('rgba', width, height)
+  if (width * height * frames > MAX_PIXEL_FRAMES) {
     throw new Error('Export exceeds the canvas or total rendered pixel limit')
   }
   return { fps, frames, width, height, duration: frames / fps, fromUs, toUs, videoFrom, videoTo, segments }
@@ -643,7 +646,7 @@ export async function exportRecording(options: ExportRecordingOptions): Promise<
     void encoding.closed.then(() => {
       if (!inputFinished) abort.abort(new Error('FFmpeg exited before export completed'))
     })
-    const renderer = await createFramePool({ width: plan.width, height: plan.height }, size, { signal: abort.signal })
+    const renderer = await createFramePool(planRender(recording, { width: plan.width, height: plan.height }, 'rgba'), size, { signal: abort.signal })
     pool = renderer
     const runs: Array<{ pixels: Promise<Uint8Array>; repeats: number }> = []
     const stream = encoding.child.stdin
@@ -764,10 +767,10 @@ function asError(error: unknown): Error {
 }
 
 export async function createFramePool(profile: RenderProfile, size: 1 | 2, options: PoolOptions = {}): Promise<FramePool> {
-  if (![1, 2].includes(size) || !Number.isSafeInteger(profile.width) || !Number.isSafeInteger(profile.height) ||
-      profile.width < 1 || profile.height < 1 || profile.width * profile.height > 4_000_000) {
-    throw new Error('Invalid render pool geometry or size')
-  }
+  profile = renderProfileSchema.parse(profile)
+  if (![1, 2].includes(size) || profile.kind === 'png' && size !== 1) throw new Error('Invalid render pool size')
+  const { pixelWidth: width, pixelHeight: height } = profile.layout
+  const releaseScreenshot = profile.kind === 'png' ? reserveScreenshot(width * height) : undefined
   const spawnWorker = options.spawnWorker ?? (profile => new Worker(new URL(import.meta.resolve('./recording-render-worker.js')), { workerData: profile, env: { ...process.env, DISABLE_SYSTEM_FONTS_LOAD: '1' } }))
   const failure = deferred<never>()
   const waiters = new Set<(error: Error) => void>()
@@ -775,6 +778,11 @@ export async function createFramePool(profile: RenderProfile, size: 1 | 2, optio
   let state: PoolState = { kind: 'starting' }
   let nextId = 0
   let closing: Promise<void> | undefined
+  let spawning = true
+
+  function releaseWhenStopped(): void {
+    if (!spawning && slots.every(slot => slot.state.kind === 'exited')) releaseScreenshot?.()
+  }
 
   function fail(reason: unknown): void {
     if (state.kind === 'failed' || state.kind === 'closed') return
@@ -845,6 +853,7 @@ export async function createFramePool(profile: RenderProfile, size: 1 | 2, optio
         if (!expected) fail(new Error(`Render worker exited unexpectedly with code ${code}`))
         slot.state = { kind: 'exited' }
         slot.exited.resolve()
+        releaseWhenStopped()
       })
       worker.on('message', (message: unknown) => {
         if (state.kind === 'failed' || state.kind === 'closing' || state.kind === 'closed') return
@@ -860,12 +869,13 @@ export async function createFramePool(profile: RenderProfile, size: 1 | 2, optio
         if (reply.kind !== 'frame' || slot.state.kind !== 'busy') { fail(new Error('Unsolicited render worker response')); return }
         const job = slot.state.job
         const bytes = Buffer.from(reply.pixels.buffer, reply.pixels.byteOffset, reply.pixels.byteLength)
-        const validPixels = profile.png
-          ? bytes.length >= 33 && bytes.length <= profile.width * profile.height * 4 + 65536 &&
+        // PNG needs room for scanline filters and compression/chunk overhead beyond RGBA.
+        const validPixels = profile.kind === 'png'
+          ? bytes.length >= 33 && bytes.length <= width * height * 5 + 65536 &&
             bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) &&
-            bytes.readUInt32BE(8) === 13 && bytes.subarray(12, 16).toString('ascii') === 'IHDR' && bytes.readUInt32BE(16) === profile.width && bytes.readUInt32BE(20) === profile.height
-          : bytes.length === profile.width * profile.height * 4
-        if (reply.id !== job.id || reply.width !== profile.width || reply.height !== profile.height || !validPixels) {
+            bytes.readUInt32BE(8) === 13 && bytes.subarray(12, 16).toString('ascii') === 'IHDR' && bytes.readUInt32BE(16) === width && bytes.readUInt32BE(20) === height
+          : bytes.length === width * height * 4
+        if (reply.id !== job.id || reply.width !== width || reply.height !== height || !validPixels) {
           fail(new Error('Render worker frame does not match its request'))
           return
         }
@@ -881,7 +891,11 @@ export async function createFramePool(profile: RenderProfile, size: 1 | 2, optio
     fail(error)
     await close().catch(() => {})
     throw error
-  } finally { clearTimeout(startupTimer) }
+  } finally {
+    clearTimeout(startupTimer)
+    spawning = false
+    releaseWhenStopped()
+  }
 
   return {
     waitFor<T>(operation: Promise<T>): Promise<T> {
@@ -922,10 +936,75 @@ const EMOJI_PRESENTATION = /\p{Emoji_Presentation}/u
 const PICTOGRAPHIC = /\p{Extended_Pictographic}/u
 const measureColumns: (text: string) => number = wcwidth
 const EMOJI_FONT = fileURLToPath(new URL('../assets/noto-emoji/NotoEmoji.ttf', import.meta.url))
-let activeScreenshots = 0
+const activeScreenshots = new Set<{ pixels: number }>()
 let imageResources: Promise<{ native: typeof import('@napi-rs/canvas'); fonts: string[] }> | undefined
 
-export interface RenderProfile { width: number; height: number; png?: boolean; imageOptions?: RenderImageOptions }
+const screenshotOptionsSchema = z.strictObject({
+  width: z.number().positive().optional(), height: z.number().positive().optional(),
+  fontSize: z.number().positive().optional(), lineHeight: z.number().positive().optional(),
+  paddingX: z.number().nonnegative().optional(), paddingY: z.number().nonnegative().optional(),
+  devicePixelRatio: z.number().positive().optional(), frameColor: z.string().optional(),
+  theme: z.strictObject({ background: z.string(), text: z.string() }).optional(),
+})
+export type ScreenshotOptions = z.infer<typeof screenshotOptionsSchema>
+
+const renderLayoutSchema = z.strictObject({
+  width: z.number().positive(), height: z.number().positive(),
+  pixelWidth: z.number().int().positive(), pixelHeight: z.number().int().positive(),
+  cellWidth: z.number().positive(), cellHeight: z.number().int().positive(),
+  scale: z.number().positive(), fontSize: z.number().positive(),
+  paddingX: z.number().nonnegative(), paddingY: z.number().nonnegative(),
+  frameColor: z.string().optional(), theme: z.strictObject({ background: z.string(), text: z.string() }),
+})
+type RenderLayout = z.infer<typeof renderLayoutSchema>
+export const renderProfileSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('png'), layout: renderLayoutSchema }),
+  z.strictObject({ kind: z.literal('rgba'), layout: renderLayoutSchema }),
+]).superRefine((profile, ctx) => {
+  const { layout } = profile
+  if (layout.pixelWidth !== Math.ceil(layout.width * layout.scale) ||
+      layout.pixelHeight !== Math.ceil(layout.height * layout.scale) || layout.cellWidth !== layout.fontSize * 0.6) {
+    ctx.addIssue({ code: 'custom', message: 'Render layout does not match its physical dimensions or font size' })
+  }
+  try { validateCanvas(profile.kind, layout.pixelWidth, layout.pixelHeight) }
+  catch (error) { ctx.addIssue({ code: 'custom', message: asError(error).message }) }
+})
+export type RenderProfile = z.infer<typeof renderProfileSchema>
+
+function validateCanvas(kind: RenderProfile['kind'], width: number, height: number): void {
+  const { maxPixels, maxSide } = RENDER_LIMITS[kind]
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1 ||
+      width > maxSide || height > maxSide || width * height > maxPixels) {
+    throw new Error(`${kind === 'png' ? 'Screenshot' : 'Video'} canvas ${width}x${height} exceeds the ${maxPixels} pixel or ${maxSide} pixel side limit`)
+  }
+}
+
+export function planRender(data: Pick<TerminalData, 'cols' | 'rows'>, options: ScreenshotOptions, kind: RenderProfile['kind']): RenderProfile {
+  const parsed = screenshotOptionsSchema.parse(options)
+  const fontSize = parsed.fontSize ?? FONT_SIZE
+  const cellWidth = fontSize * 0.6
+  const cellHeight = Math.round(fontSize * (parsed.lineHeight ?? LINE_HEIGHT))
+  const scale = parsed.devicePixelRatio ?? 1
+  const paddingX = parsed.paddingX ?? 0, paddingY = parsed.paddingY ?? 0
+  const width = parsed.width ?? Math.ceil(data.cols * cellWidth + paddingX * 2)
+  const height = parsed.height ?? data.rows * cellHeight + paddingY * 2
+  return renderProfileSchema.parse({ kind, layout: {
+    width, height, pixelWidth: Math.ceil(width * scale), pixelHeight: Math.ceil(height * scale),
+    cellWidth, cellHeight, scale, fontSize, paddingX, paddingY,
+    frameColor: parsed.frameColor, theme: parsed.theme ?? { background: BACKGROUND, text: TEXT },
+  } })
+}
+
+function reserveScreenshot(pixels: number): () => void {
+  if (activeScreenshots.size >= 2) throw new Error('Two screenshots are already rendering; retry after one finishes')
+  const activePixels = [...activeScreenshots].reduce((sum, job) => sum + job.pixels, 0)
+  if (activePixels + pixels > RENDER_LIMITS.png.maxPixels) {
+    throw new Error(`Screenshot needs ${pixels} pixels, but ${activePixels} of ${RENDER_LIMITS.png.maxPixels} pixels are already rendering; retry after a screenshot finishes`)
+  }
+  const reservation = { pixels }
+  activeScreenshots.add(reservation)
+  return () => { activeScreenshots.delete(reservation) }
+}
 
 function isEmojiGrapheme(text: string): boolean {
   return EMOJI_PRESENTATION.test(text) || /[0-9#*]\ufe0f?\u20e3/u.test(text) || text.includes('\ufe0f') && PICTOGRAPHIC.test(text)
@@ -995,6 +1074,16 @@ const BOX_EDGES: Record<string, number> = {
 const QUADRANTS: Record<string, number> = {
   '▖': 4, '▗': 8, '▘': 1, '▙': 13, '▚': 9, '▛': 7, '▜': 11, '▝': 2, '▞': 6, '▟': 14,
 }
+const POWERLINE_SHAPES = new Map<string, { closed: boolean; points: Array<[number, number]> }>([
+  ['\ue0b0', { closed: true, points: [[0, 0], [1, 0.5], [0, 1]] }],
+  ['\ue0b1', { closed: false, points: [[0, 0], [1, 0.5], [0, 1]] }],
+  ['\ue0b2', { closed: true, points: [[1, 0], [0, 0.5], [1, 1]] }],
+  ['\ue0b3', { closed: false, points: [[1, 0], [0, 0.5], [1, 1]] }],
+  ['\ue0b8', { closed: true, points: [[0, 0], [1, 1], [0, 1]] }],
+  ['\ue0ba', { closed: true, points: [[1, 0], [1, 1], [0, 1]] }],
+  ['\ue0bc', { closed: true, points: [[0, 0], [1, 0], [0, 1]] }],
+  ['\ue0be', { closed: true, points: [[0, 0], [1, 0], [1, 1]] }],
+])
 
 function vectorGlyph(text: string, x: number, y: number, width: number, height: number, color: string): DrawOp[] | undefined {
   const code = text.codePointAt(0)
@@ -1065,32 +1154,16 @@ function vectorGlyph(text: string, x: number, y: number, width: number, height: 
     return positions.flatMap(([column, row], bit): DrawOp[] => dots & (1 << bit)
       ? [{ kind: 'circle', x: x + width * (column + 0.5) / 2, y: y + height * (row + 0.5) / 4, radius, color }] : [])
   }
-  if (code >= 0xe0b0 && code <= 0xe0b3) {
-    const pointsRight = code < 0xe0b2
-    const edge = pointsRight ? x : right, tip = pointsRight ? right : x
-    const d = `M${edge} ${y}L${tip} ${cy}L${edge} ${bottom}`
-    return code % 2 === 0 ? [{ kind: 'path', d: d + 'Z', color }] : path(d)
+  const powerline = POWERLINE_SHAPES.get(text)
+  if (powerline) {
+    const d = powerline.points.map(([px, py], index) => `${index === 0 ? 'M' : 'L'}${x + px * width} ${y + py * height}`).join('')
+    return powerline.closed ? [{ kind: 'path', d: d + 'Z', color }] : path(d)
   }
   return undefined
 }
 
-function terminalScene(data: TerminalData, options: RenderImageOptions = {}): TerminalScene {
-  const fontSize = options.fontSize ?? FONT_SIZE
-  const lineHeight = options.lineHeight ?? LINE_HEIGHT
-  const cellWidth = fontSize * 0.6
-  const cellHeight = Math.round(fontSize * lineHeight)
-  const paddingX = options.paddingX ?? 0
-  const paddingY = options.paddingY ?? 0
-  const theme = options.theme ?? { background: BACKGROUND, text: TEXT }
-  const width = options.width ?? Math.ceil(data.cols * cellWidth + paddingX * 2)
-  const height = options.height ?? data.rows * cellHeight + paddingY * 2
-  for (const value of [fontSize, lineHeight, cellWidth, cellHeight, width, height, options.devicePixelRatio ?? 1]) {
-    if (!Number.isFinite(value) || value <= 0) throw new Error('Render dimensions and scale must be positive and finite')
-  }
-  if (![paddingX, paddingY].every(value => Number.isFinite(value) && value >= 0)) throw new Error('Render padding must be nonnegative and finite')
-  if (Math.ceil(width * (options.devicePixelRatio ?? 1)) * Math.ceil(height * (options.devicePixelRatio ?? 1)) > MAX_PIXELS) {
-    throw new Error('Render canvas exceeds pixel limit')
-  }
+function terminalScene(data: TerminalData, layout: RenderLayout): TerminalScene {
+  const { fontSize, cellWidth, cellHeight, paddingX, paddingY, theme, width, height, scale } = layout
   const backgrounds: DrawOp[] = []
   const foreground: DrawOp[] = []
   for (let row = 0; row < data.rows; row++) {
@@ -1134,8 +1207,8 @@ function terminalScene(data: TerminalData, options: RenderImageOptions = {}): Te
       edgeColors.set(color, (edgeColors.get(color) ?? 0) + 1)
     }
   }
-  const frameColor = options.frameColor ?? ((paddingX || paddingY) ? [...edgeColors].sort((a, b) => b[1] - a[1])[0]?.[0] : undefined) ?? theme.background
-  const scene: TerminalScene = { width, height, scale: options.devicePixelRatio ?? 1, paddingX, paddingY,
+  const frameColor = layout.frameColor ?? ((paddingX || paddingY) ? [...edgeColors].sort((a, b) => b[1] - a[1])[0]?.[0] : undefined) ?? theme.background
+  const scene: TerminalScene = { width, height, scale, paddingX, paddingY,
     viewportWidth: data.cols * cellWidth, viewportHeight: data.rows * cellHeight,
     frameColor, background: theme.background, backgrounds, foreground }
   if (data.cursorVisible && data.cursor[0] >= 0 && data.cursor[0] < data.cols && data.cursor[1] >= 0 && data.cursor[1] < data.rows) {
@@ -1145,10 +1218,10 @@ function terminalScene(data: TerminalData, options: RenderImageOptions = {}): Te
   return scene
 }
 
-async function rasterizeTerminal(data: TerminalData, options: RenderImageOptions) {
+async function rasterizeTerminal(data: TerminalData, layout: RenderLayout) {
   const { native } = await initializeRenderer()
-  const scene = terminalScene(data, options)
-  const canvas = native.createCanvas(Math.ceil(scene.width * scene.scale), Math.ceil(scene.height * scene.scale))
+  const scene = terminalScene(data, layout)
+  const canvas = native.createCanvas(layout.pixelWidth, layout.pixelHeight)
   const ctx = canvas.getContext('2d')
   ctx.scale(scene.scale, scene.scale)
   ctx.fillStyle = scene.frameColor
@@ -1187,7 +1260,7 @@ async function rasterizeTerminal(data: TerminalData, options: RenderImageOptions
   const cursor = scene.cursor
   if (cursor) {
     ctx.fillStyle = ctx.strokeStyle = cursor.color
-    if (cursor.style === 'bar') ctx.fillRect(cursor.x, cursor.y, Math.max(1, (options.fontSize ?? FONT_SIZE) / 7), cursor.height)
+    if (cursor.style === 'bar') ctx.fillRect(cursor.x, cursor.y, Math.max(1, layout.fontSize / 7), cursor.height)
     else if (cursor.style === 'underline') ctx.fillRect(cursor.x, cursor.y + cursor.height - 2, cursor.width, 2)
     else if (cursor.style === 'block_hollow') { ctx.lineWidth = 1; ctx.strokeRect(cursor.x + 0.5, cursor.y + 0.5, Math.max(0, cursor.width - 1), Math.max(0, cursor.height - 1)) }
     else {
@@ -1200,28 +1273,25 @@ async function rasterizeTerminal(data: TerminalData, options: RenderImageOptions
   return canvas
 }
 
-export async function renderTerminalPng(data: TerminalData, options: RenderImageOptions = {}): Promise<Uint8Array<ArrayBuffer>> {
-  return new Uint8Array(await (await rasterizeTerminal(data, options)).encode('png'))
-}
-
-export async function renderTerminalImage(data: TerminalData, options: RenderImageOptions = {}): Promise<Buffer> {
-  if (activeScreenshots >= 2) throw new Error('Two screenshots are already rendering; retry after one finishes')
-  const scene = terminalScene(data, options)
-  activeScreenshots++
+export async function renderTerminalImage(data: TerminalData, options: ScreenshotOptions = {}): Promise<Buffer> {
+  const profile = planRender(data, options, 'png')
   let pool: FramePool | undefined
   try {
-    pool = await createFramePool({ width: Math.ceil(scene.width * scene.scale), height: Math.ceil(scene.height * scene.scale), png: true, imageOptions: options }, 1)
-    const png = await pool.render(data)
+    pool = await createFramePool(profile, 1)
+    const png = Buffer.from(await pool.render(data))
     await pool.close()
-    return Buffer.from(png)
+    return png
   } finally {
     await pool?.close().catch(() => {})
-    activeScreenshots--
   }
 }
 
-export async function renderFrame(data: TerminalData, profile: RenderProfile): Promise<Uint8Array<ArrayBuffer>> {
-  const image = await rasterizeTerminal(data, { ...profile, fontSize: FONT_SIZE, lineHeight: LINE_HEIGHT, paddingX: 0, paddingY: 0,
-    devicePixelRatio: 1, theme: { background: BACKGROUND, text: TEXT }, frameColor: BACKGROUND })
+export async function renderWorkerOutput(data: TerminalData, profile: RenderProfile): Promise<Uint8Array<ArrayBuffer>> {
+  const image = await rasterizeTerminal(data, profile.layout)
+  if (profile.kind === 'png') return new Uint8Array(await image.encode('png'))
   return new Uint8Array(image.getContext('2d').getImageData(0, 0, image.width, image.height).data)
+}
+
+export async function renderFrame(data: TerminalData, dimensions: { width: number; height: number }): Promise<Uint8Array<ArrayBuffer>> {
+  return renderWorkerOutput(data, planRender(data, dimensions, 'rgba'))
 }

@@ -10,7 +10,7 @@ import { PersistentTerminal, type TerminalData } from 'ghostty-opentui'
 import { renderTerminalImage as renderTerminalToImage, renderFrame } from './recording.js'
 import { createSession, Session } from './session.js'
 import { spawnNative as spawn } from './pty-native.js'
-import { Recorder, exportRecording, parseRecording, planRecording, sourceTimeAtFrame, createFramePool, type FramePool } from './recording.js'
+import { Recorder, exportRecording, parseRecording, planRecording, sourceTimeAtFrame, createFramePool, planRender, type FramePool } from './recording.js'
 
 // Darwin revokes the controlling terminal when its session leader exits.
 const linuxTest = process.platform === 'linux' ? test : test.skip
@@ -344,6 +344,15 @@ describe('offline export', () => {
   const ffmpegAvailable = spawnSync('ffmpeg', ['-version']).status === 0 && spawnSync('ffprobe', ['-version']).status === 0
   const videoTest = ffmpegAvailable ? test : test.skip
 
+  videoTest('exports a terminal larger than Full HD without losing the final cell', async () => {
+    const options = await fixture([[0, 'o', '\x1b[52;229HZ']], { cols: 229, rows: 52 })
+    const result = await exportRecording(options)
+    expect([result.width, result.height, result.frames]).toEqual([1924, 1092, 1])
+    const frame = pixels(result.path, 0)
+    expect(frame.length).toBe(1924 * 1092 * 3)
+    expect(glyphColumns(frame, 1924, 1916, 1924, 1071, 1092)).toBeGreaterThan(2)
+  }, 20_000)
+
   videoTest('screenshot and export initialize safely in either order', async () => {
     const order = process.env.TUISTORY_EXPORT_INIT_ORDER
     if (!order) {
@@ -637,7 +646,7 @@ describe('render worker pool', () => {
   const exits: Promise<void>[] = []
   const data: TerminalData = { cols: 1, rows: 1, cursor: [0, 0], cursorVisible: false, cursorStyle: 'default', offset: 0, totalLines: 1,
     lines: [{ spans: [{ text: 'A', fg: null, bg: null, flags: 0, width: 1 }] }] }
-  const profile = { width: 2, height: 2 }
+  const profile = planRender(data, { width: 2, height: 2 }, 'rgba')
 
   beforeEach(async () => {
     directory = await mkdtemp(path.join(os.tmpdir(), 'tuistory-worker-test-'))
@@ -752,7 +761,7 @@ port.on('message', ({id, data}) => {
   })
 
   test('real native workers initialize fonts and preserve complete-frame pixels', async () => {
-    const renderer = await createFramePool({ width: 18, height: 22 }, 2)
+    const renderer = await createFramePool(planRender(data, { width: 18, height: 22 }, 'rgba'), 2)
     pools.push(renderer)
     const [first, second] = await Promise.all([renderer.render(data), renderer.render(data)])
     expect(first.byteLength).toBe(18 * 22 * 4)
@@ -760,6 +769,61 @@ port.on('message', ({id, data}) => {
     expect(first.some((value, index) => index % 4 !== 3 && value > 100)).toBe(true)
     await renderer.close()
   })
+
+  test('screenshot capacity stays reserved after timeout until workers actually exit', async () => {
+    const pngProfile = planRender(data, { width: 2, height: 2 }, 'png')
+    const gates: Array<() => void> = []
+    const spawn = factory(['normal', 'normal'])
+    const delayedWorker = () => {
+      const worker = spawn()
+      const terminate = worker.terminate.bind(worker)
+      const released = new Promise<void>(resolve => gates.push(resolve))
+      worker.terminate = async () => { await released; return terminate() }
+      return worker
+    }
+    const first = await createFramePool(pngProfile, 1, { spawnWorker: delayedWorker, shutdownMs: 40 })
+    const second = await createFramePool(pngProfile, 1, { spawnWorker: delayedWorker, shutdownMs: 40 })
+    pools.push(first, second)
+    try {
+      await Promise.all([
+        expect(first.close()).rejects.toThrow('shutdown timed out'),
+        expect(second.close()).rejects.toThrow('shutdown timed out'),
+      ])
+      await expect(renderTerminalToImage(data)).rejects.toThrow('already rendering')
+    } finally { for (const release of gates) release() }
+    await Promise.all(exits)
+    const image = await renderTerminalToImage(data)
+    expect([image.readUInt32BE(16), image.readUInt32BE(20)]).toEqual([9, 21])
+  }, 10_000)
+
+  test('screenshot byte capacity rejects a second large job without evicting the first', async () => {
+    const maximum = planRender(data, { width: 4096, height: 4096 }, 'png')
+    const first = await createFramePool(maximum, 1, { spawnWorker: factory(['normal']) })
+    pools.push(first)
+    await expect(renderTerminalToImage(data, { width: 1, height: 1 })).rejects.toThrow('already rendering')
+    await first.close()
+    const image = await renderTerminalToImage(data, { width: 1, height: 1 })
+    expect([image.readUInt32BE(16), image.readUInt32BE(20)]).toEqual([1, 1])
+  })
+
+  for (const mode of ['constructor-error', 'startup-error', 'crash', 'bad-length']) {
+    test(`screenshot ${mode} releases admission after cleanup`, async () => {
+      const pngProfile = planRender(data, { width: 4096, height: 4096 }, 'png')
+      if (mode === 'constructor-error' || mode === 'startup-error') {
+        await expect(createFramePool(pngProfile, 1, { spawnWorker: factory([mode]) })).rejects.toThrow()
+      } else {
+        const renderer = await createFramePool(pngProfile, 1, { spawnWorker: factory([mode]) })
+        pools.push(renderer)
+        const [result] = await Promise.allSettled([renderer.render(data)])
+        expect(result.status).toBe('rejected')
+        if (result.status === 'rejected') expect(result.reason).toBeInstanceOf(Error)
+        await expect(renderer.close()).rejects.toThrow()
+      }
+      await Promise.all(exits)
+      const image = await renderTerminalToImage(data)
+      expect([image.readUInt32BE(16), image.readUInt32BE(20)]).toEqual([9, 21])
+    })
+  }
 
 
   test('encoder abort interrupts partial worker startup without waiting for the startup deadline', async () => {
@@ -828,8 +892,9 @@ import {parentPort as p,workerData as settings} from 'node:worker_threads';
 if(settings.mode !== 'encoder-startup-failure') p.postMessage({kind:'ready'});
 p.on('message',({id})=>{
  if(settings.mode === 'crash') throw Error('controlled raster crash');
- const pixels=new Uint8Array(settings.width*settings.height*4).fill(10*(id+1));
- const send=()=>p.postMessage({kind:'frame',id,width:settings.width,height:settings.height,pixels},[pixels.buffer]);
+ const {pixelWidth:width,pixelHeight:height}=settings.layout;
+ const pixels=new Uint8Array(width*height*4).fill(10*(id+1));
+ const send=()=>p.postMessage({kind:'frame',id,width,height,pixels},[pixels.buffer]);
  setTimeout(send,settings.mode==='ordered' && id===0?80:0);
  if(settings.mode==='idle-crash') setTimeout(()=>{throw Error('controlled idle crash')},10);
 });
@@ -907,8 +972,8 @@ port.postMessage({kind:'ready'});
     await writeFile(path.join(directory, 'gc-runner.mjs'), `
 import {Worker} from 'node:worker_threads';
 import {pathToFileURL} from 'node:url';
-const {createFramePool}=await import(pathToFileURL(process.argv[2]));
-const renderer=await createFramePool({width:2,height:2},1,{spawnWorker:()=>new Worker(new URL('./gc-worker.mjs',import.meta.url),{execArgv:[]})});
+const {createFramePool,planRender}=await import(pathToFileURL(process.argv[2]));
+const renderer=await createFramePool(planRender({cols:1,rows:1},{width:2,height:2},'rgba'),1,{spawnWorker:()=>new Worker(new URL('./gc-worker.mjs',import.meta.url),{execArgv:[]})});
 async function collect() {
  const refs=[];
  for(let i=0;i<32;i++) {
@@ -934,7 +999,7 @@ console.log(JSON.stringify({retained}));
 describe('native terminal rendering', () => {
   const nativeTest = spawnSync('ffmpeg', ['-version']).status === 0 ? test : test.skip
   function decodePng(png: Buffer): Buffer {
-    const result = spawnSync('ffmpeg', ['-v', 'error', '-i', 'pipe:0', '-threads', '1', '-f', 'rawvideo', '-pix_fmt', 'rgba', 'pipe:1'], { input: png, maxBuffer: 16 * 1024 * 1024 })
+    const result = spawnSync('ffmpeg', ['-v', 'error', '-i', 'pipe:0', '-threads', '1', '-f', 'rawvideo', '-pix_fmt', 'rgba', 'pipe:1'], { input: png, maxBuffer: 68 * 1024 * 1024 })
     if (result.status !== 0) throw new Error(result.stderr.toString())
     return result.stdout
   }
@@ -942,6 +1007,90 @@ describe('native terminal rendering', () => {
     const term = new PersistentTerminal({ cols, rows })
     try { term.feed(content); await check(term.getJson({ limit: rows })) } finally { term.destroy() }
   }
+  nativeTest('Powerline separators cover their cell geometry at different scales and colors', async () => {
+    const filled = [
+      { glyph: '\ue0b0', inside: [0.15, 0.5], outside: [0.9, 0.1] },
+      { glyph: '\ue0b2', inside: [0.85, 0.5], outside: [0.1, 0.1] },
+      { glyph: '\ue0b8', inside: [0.25, 0.9], outside: [0.75, 0.1] },
+      { glyph: '\ue0ba', inside: [0.75, 0.9], outside: [0.25, 0.1] },
+      { glyph: '\ue0bc', inside: [0.25, 0.1], outside: [0.75, 0.9] },
+      { glyph: '\ue0be', inside: [0.75, 0.1], outside: [0.25, 0.9] },
+    ]
+    for (const settings of [
+      { fontSize: 14, devicePixelRatio: 1, inverse: false },
+      { fontSize: 18, devicePixelRatio: 2, inverse: true },
+    ]) {
+      await terminal('\x1b[?25l' + (settings.inverse ? '\x1b[7m' : '') + filled.map(item => item.glyph).join('') + '\ue0b1\ue0b3', async data => {
+        const png = await renderTerminalToImage(data, { fontSize: settings.fontSize, devicePixelRatio: settings.devicePixelRatio })
+        const rgba = decodePng(png)
+        const width = png.readUInt32BE(16)
+        const cellWidth = settings.fontSize * 0.6 * settings.devicePixelRatio
+        const cellHeight = Math.round(settings.fontSize * 1.5) * settings.devicePixelRatio
+        const light = [192, 202, 245, 255], dark = [26, 27, 38, 255]
+        for (const [column, item] of filled.entries()) {
+          for (const [point, expected] of [[item.inside, settings.inverse ? dark : light], [item.outside, settings.inverse ? light : dark]]) {
+            const x = Math.floor((column + point[0]) * cellWidth), y = Math.floor(point[1] * cellHeight)
+            const offset = (y * width + x) * 4
+            expect([...rgba.subarray(offset, offset + 4)]).toEqual(expected)
+          }
+        }
+        for (const column of [6, 7]) {
+          const x = Math.floor((column + 0.5) * cellWidth), y = Math.floor(cellHeight / 2)
+          const offset = (y * width + x) * 4
+          expect([...rgba.subarray(offset, offset + 4)]).toEqual(settings.inverse ? light : dark)
+          const endX = Math.floor((column + (column === 6 ? 0 : 1)) * cellWidth) - (column === 7 ? 1 : 0)
+          const edge = (width * settings.devicePixelRatio + endX) * 4
+          expect(Math.abs(rgba[edge] - (settings.inverse ? 192 : 26))).toBeGreaterThan(60)
+        }
+        if (!settings.inverse) expect(rgba).toEqual(Buffer.from(await renderFrame(data, { width, height: png.readUInt32BE(20) })))
+      }, 8, 2)
+    }
+  }, 20_000)
+
+  nativeTest('unsupported screenshot options fail explicitly without poisoning later screenshots', async () => {
+    await terminal('\x1b[?25lHello', async data => {
+      const withFont = { fontPath: '/missing/font.ttf', fontSize: 14 }
+      const withUnknown = { ignoredOption: true, fontSize: 14 }
+      await expect(renderTerminalToImage(data, withFont)).rejects.toThrow('fontPath')
+      await expect(renderTerminalToImage(data, withUnknown)).rejects.toThrow('ignoredOption')
+      const png = await renderTerminalToImage(data, { fontSize: 14 })
+      expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([101, 84])
+    })
+  })
+
+  nativeTest('a 160 by 50 retina screenshot retains its bottom-right cell', async () => {
+    await terminal('\x1b[?25l\x1b[50;160H\x1b[48;2;255;0;0m ', async data => {
+      const png = await renderTerminalToImage(data, { devicePixelRatio: 2 })
+      expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([2688, 2100])
+      const rgba = decodePng(png)
+      expect(rgba.byteLength).toBe(2688 * 2100 * 4)
+      expect([...rgba.subarray(-8, -4)]).toEqual([255, 0, 0, 255])
+    }, 160, 50)
+  }, 15_000)
+
+  nativeTest('two retina screenshots fit the shared capacity and recover after a rejection', async () => {
+    await terminal('\x1b[?25l', async data => {
+      const first = renderTerminalToImage(data, { devicePixelRatio: 2 })
+      const second = renderTerminalToImage(data, { devicePixelRatio: 2 })
+      await expect(renderTerminalToImage(data)).rejects.toThrow(/screenshots|capacity|rendering/i)
+      const images = await Promise.all([first, second])
+      expect(images.map(png => [png.readUInt32BE(16), png.readUInt32BE(20)])).toEqual([[2688, 2100], [2688, 2100]])
+      const after = await renderTerminalToImage(data, { width: 16, height: 16 })
+      expect([after.readUInt32BE(16), after.readUInt32BE(20)]).toEqual([16, 16])
+    }, 160, 50)
+  }, 20_000)
+
+  nativeTest('screenshots enforce physical pixel limits without changing video limits', async () => {
+    await terminal('\x1b[?25l', async data => {
+      for (const options of [{ width: 4096, height: 4097 }, { width: 16385, height: 1 }, { devicePixelRatio: Infinity }]) {
+        await expect(renderTerminalToImage(data, options)).rejects.toThrow()
+      }
+      await expect(renderFrame(data, { width: 2000, height: 2001 })).rejects.toThrow()
+      const image = await renderTerminalToImage(data, { width: 2000, height: 2001 })
+      expect([image.readUInt32BE(16), image.readUInt32BE(20)]).toEqual([2000, 2001])
+    })
+  }, 15_000)
+
   nativeTest('PNG screenshots and video RGBA share identical native pixels including trailing blank rows', async () => {
     await terminal('\x1b[?25lA😀B中C\r\n\x1b[31mRED\x1b[0m é', async data => {
       const profile = { width: 102, height: 84 }
