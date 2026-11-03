@@ -325,3 +325,17 @@ posixTest('a suspended restart cannot be overtaken after ten seconds or destroy 
   expect(sessions.stdout).toContain('paused-owner-survivor')
   expect(fs.readFileSync(pidFile, 'utf8')).toBe(pid)
 }, 25000)
+
+posixTest('a CLI command arriving during daemon gracefulShutdown waits and starts a replacement instead of failing with 503', async () => {
+  const script = path.join(directory, 'slow-stop.sh')
+  const recordPath = path.join(directory, 'slow-stop.cast')
+  fs.writeFileSync(script, "trap 'sleep 0.6; exit 0' TERM HUP\nprintf READY\nwhile :; do sleep 0.05; done\n")
+  expect(await cli('launch', `sh ${JSON.stringify(script)}`, '-s', 'slow-stop', '--record', recordPath, '--no-wait').done).toMatchObject({ code: 0 })
+  expect(await cli('wait', 'READY', '-s', 'slow-stop').done).toMatchObject({ code: 0 })
+  const stop = cli('daemon-stop')
+  await sleep(150)
+  const concurrent = await cli('sessions').done
+  expect(await stop.done).toMatchObject({ code: 0 })
+  expect(concurrent.stderr).not.toContain('Relay is shutting down')
+  expect(concurrent.code).toBe(0)
+}, 20000)

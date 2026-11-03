@@ -301,3 +301,31 @@ try {
   expect(result.stdout.trim()).toBe('plain session: input, resize, output and close passed without zigpty')
   } finally { fs.rmSync(directory, { recursive: true, force: true }) }
 }, 20000)
+
+test('closeAsync notifies late onClosing listeners immediately, ignores late subscribers, and marks outputState incomplete on close timeout', async () => {
+  const fixture = fixtureDirectory(`${process.release.name}-close-timeout`)
+  const { directory } = fixture
+  const file = path.join(directory, 'timeout.cast')
+  const session = await createSession({
+    command: 'sh',
+    args: ['-c', "trap 'exit 0' TERM HUP; printf READY; while :; do sleep 0.05; done"],
+    cwd: directory,
+    record: { path: file },
+  })
+  fixture.session = session
+  await session.waitForText('READY')
+  const recorder = (session as unknown as { recorder: { finishProcess: (info: { exitCode: number; signal: number }) => Promise<unknown> } }).recorder
+  const origFinishProcess = recorder.finishProcess.bind(recorder)
+  recorder.finishProcess = async (info) => {
+    await new Promise((resolve) => setTimeout(resolve, 5300))
+    return origFinishProcess(info)
+  }
+  const closingPromise = session.closeAsync('custom-reason')
+  const lateReasons: string[] = []
+  session.onClosing((reason) => { lateReasons.push(reason) })
+  session.subscribe(() => {})
+  expect(lateReasons).toEqual(['custom-reason'])
+  expect((session as unknown as { dataSubscribers: Set<unknown> }).dataSubscribers.size).toBe(0)
+  await expect(closingPromise).rejects.toThrow('Session close did not finish within 5000ms')
+  expect((session as unknown as { outputState: string }).outputState).toBe('incomplete')
+}, 15000)

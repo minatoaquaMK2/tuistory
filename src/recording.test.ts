@@ -69,6 +69,30 @@ describe('recorder and session', () => {
     expect(await cast(`${file}.partial`)).toHaveLength(3)
   })
 
+  test('finalization timeout awaits cleanupPublished before resolving partial status', async () => {
+    const { link } = await import('node:fs/promises')
+    const file = path.join(directory, 'timeout-cleanup.cast')
+    const recorder = await Recorder.prepare({ path: file, cols: 80, rows: 24 })
+    recorder.start()
+    recorder.output('hello')
+    const internal = recorder as unknown as {
+      file: { close: () => Promise<void> }
+      partialPath: string
+      linked: boolean
+    }
+    const origClose = internal.file.close.bind(internal.file)
+    internal.file.close = async () => {
+      await origClose()
+      await link(internal.partialPath, file)
+      internal.linked = true
+      await new Promise((resolve) => setTimeout(resolve, 5200))
+    }
+    const status = await recorder.stop()
+    const existsAtReturn = existsSync(file)
+    expect(status.kind).toBe('partial')
+    expect(existsAtReturn).toBe(false)
+  }, 15000)
+
   linuxTest('native PTY drains trailing output after the main process exits', async () => {
     const pty = spawn('sh', ['-c', "(trap '' HUP; sleep .08; printf TAIL) & printf HEAD; sleep .02; exit 7"], { cols: 80, rows: 24 })
     let output = ''
