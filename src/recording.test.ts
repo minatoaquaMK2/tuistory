@@ -12,6 +12,9 @@ import { createSession, Session } from './session.js'
 import { spawnNative as spawn } from './pty-native.js'
 import { Recorder, exportRecording, parseRecording, planRecording, sourceTimeAtFrame, createFramePool, type FramePool } from './recording.js'
 
+// Darwin revokes the controlling terminal when its session leader exits.
+const linuxTest = process.platform === 'linux' ? test : test.skip
+
 describe('recorder and session', () => {
   let directory: string
   beforeEach(async () => { directory = await mkdtemp(path.join(os.tmpdir(), 'tuistory-recording-test-')) })
@@ -66,7 +69,7 @@ describe('recorder and session', () => {
     expect(await cast(`${file}.partial`)).toHaveLength(3)
   })
 
-  test('native PTY drains trailing output after the main process exits', async () => {
+  linuxTest('native PTY drains trailing output after the main process exits', async () => {
     const pty = spawn('sh', ['-c', "(trap '' HUP; sleep .08; printf TAIL) & printf HEAD; sleep .02; exit 7"], { cols: 80, rows: 24 })
     let output = ''
     const events: string[] = []
@@ -133,7 +136,22 @@ describe('recorder and session', () => {
     expect(() => new Session(options)).toThrow('Recording requires')
   })
 
-  test('session waiters accept output arriving after the process result', async () => {
+  test('session waiters retain final output and its recorded exit status', async () => {
+    const file = path.join(directory, 'final.cast')
+    const session = await createSession({ command: 'sh', args: ['-c', 'printf HEAD; sleep .02; printf TAIL; exit 7'], record: { path: file } })
+    try {
+      expect(await session.waitForText('TAIL')).toContain('TAIL')
+      expect(await session.waitForExit()).toBe(true)
+    } finally {
+      await session.closeAsync()
+    }
+    expect(session.recording?.status()).toMatchObject({ kind: 'saved', extent: 'process' })
+    const events = await cast(file)
+    expect(events.flatMap(event => Array.isArray(event) && event[1] === 'o' ? [event[2]] : []).join('')).toBe('HEADTAIL')
+    expect(events.at(-1)).toEqual(expect.arrayContaining(['x', '7']))
+  })
+
+  linuxTest('session waiters accept output arriving after the process result', async () => {
     const session = await createSession({ command: 'sh', args: ['-c', "(trap '' HUP; sleep .08; printf TAIL) & sleep .02; exit 7"], record: { path: path.join(directory, 'tail.cast') } })
     try {
       expect(await session.waitForText('TAIL')).toContain('TAIL')

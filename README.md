@@ -251,6 +251,8 @@ Use `--speed 2` for double speed, `--idle-limit 3` to shorten waits, or `--from 
 
 Recording requires a POSIX terminal and supports up to 400 columns by 120 rows. It captures terminal output, including echoed secrets. Some emoji may appear as missing-glyph boxes. If recording fails, `record status` reports a partial file and the process keeps running.
 
+Keep long-lived commands in the foreground. Output from background children after their parent exits is not guaranteed.
+
 ## Background Processes (replaces tmux)
 
 tuistory replaces tmux for running background processes. The key advantage: **reactive waiting** instead of blind `sleep`.
